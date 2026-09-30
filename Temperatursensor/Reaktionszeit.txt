@@ -1,1 +1,0 @@
-Read the temprature and display a bad tempture and a warn temprature

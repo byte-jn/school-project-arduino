@@ -1,1 +1,21 @@
-Reacted as fast as posible to the light going on
+Reaktionszeit
+=============
+
+Reaktionsspiel: Nach einer zufaelligen Wartezeit (1-3 s) leuchtet die LED.
+Der Spieler drueckt so schnell wie moeglich den Taster. Die Reaktionszeit
+wird ueber die serielle Schnittstelle (9600 Baud) ausgegeben.
+
+Sketch: Reaktionszeit.ino
+
+Pins
+  13  LED (Ausgang)
+  12  Taster gegen GND (INPUT_PULLUP, gedrueckt = LOW)
+
+Ablauf
+  1. LED aus: loop() wartet random(1000, 3000) ms, merkt sich millis() als
+     Startzeit und schaltet die LED ein.
+  2. Taster gedrueckt: Differenz zur Startzeit wird als "<n> ms" im Serial
+     Monitor ausgegeben, LED geht aus, die naechste Runde beginnt.
+
+Hinweis
+  Ein Tastendruck vor dem Aufleuchten wird nicht als Fehlstart erkannt.
