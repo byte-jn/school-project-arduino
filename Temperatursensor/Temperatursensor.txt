@@ -2,21 +2,21 @@ Temperatursensor
 ================
 
 Liest die Temperatur mit einem DHT11 und zeigt sie per Ampel-LEDs an.
-Der Wert wird zusaetzlich alle 500 ms im Serial Monitor (9600 Baud)
+Der Wert wird zusätzlich alle 500 ms im Serial Monitor (9600 Baud)
 ausgegeben.
 
 Sketch: Temperatursensor.ino
 
 Pins
   2   DHT11 Datenleitung
-  11  LED gruen (OK)
+  11  LED grün (OK)
   12  LED gelb (Warnung)
   13  LED rot (zu warm)
 
 Schwellwerte
-  bis 25 C          gruen
-  ueber 25 C (warnTemp)  gelb
-  ueber 26 C (badTemp)   rot
+  bis 25 °C               grün
+  über 25 °C (warnTemp)   gelb
+  über 26 °C (badTemp)    rot
 
 Bibliotheken (siehe ../libraries)
   DHT_sensor_library, Adafruit_Unified_Sensor
