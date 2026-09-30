@@ -1,0 +1,22 @@
+AnalogeDatenauslesung
+=====================
+
+Liest den Wert eines Potentiometers am Analogeingang A3 aus und zeigt ihn
+per LED an. Der Rohwert (0-1023) wird alle 10 ms im Serial Monitor
+(9600 Baud) ausgegeben.
+
+Sketch: AnalogeDatenauslesung.ino
+
+Pins
+  A3  Potentiometer (Schleifer)
+  13  LED rot
+  12  LED gelb
+  11  LED blau
+
+Anzeige
+  Wert 0-340      rot
+  Wert 341-682    gelb
+  Wert 683-1023   blau
+
+  Der Wertebereich ist in drei gleich große Drittel geteilt, es leuchtet
+  immer genau eine LED.
