@@ -1,5 +1,5 @@
 /*
-  TemperaturSender – Knoten 1 der Laptop-Kühlung
+  LaptopKuehlung_Sensor – Knoten 1 der Laptop-Kühlung
 
   Board:  NodeMCU 1.0 (ESP-12E Module), ESP8266-Core 3.1.2
   Libs:   DHT sensor library (+ Adafruit Unified Sensor), PubSubClient

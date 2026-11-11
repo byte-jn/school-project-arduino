@@ -8,8 +8,8 @@
 | [Temperatursensor](Temperatursensor/Temperatursensor.txt) | Arduino Uno (AVR) | DHT11 misst die Temperatur, Ampel-LEDs zeigen grün (bis 25 °C), gelb (über 25 °C) oder rot (über 26 °C). |
 | [AnalogeDatenauslesung](AnalogeDatenauslesung/AnalogeDatenauslesung.txt) | Arduino Uno (AVR) | Potentiometer an A3 wird ausgelesen, drei LEDs (rot, gelb, blau) zeigen je ein Drittel des Wertebereichs, Rohwert im Serial Monitor. |
 | [Wiederstandsmessen](Wiederstandsmessen/Wiederstandsmessen.txt) | Arduino Uno (AVR) | Platzhalter: schaltet bisher nur die eingebaute LED ein. |
-| [TemperaturSender](TemperaturSender/TemperaturSender.ino) | NodeMCU 1.0 (ESP8266) | Laptop-Kühlung, Knoten 1: DHT22 misst alle 5 s, sendet die Temperatur per MQTT, LED-Ampel zeigt den Zustand. |
-| [LaptopKuehlungProjekt](LaptopKuehlungProjekt/LaptopKuehlungProjekt.ino) | NodeMCU 1.0 (ESP8266) | Laptop-Kühlung, Knoten 2: schaltet den Lüfter anhand der Temperatur (mit Hysterese und Fail-safe). |
+| [LaptopKuehlung_Sensor](LaptopKuehlung_Sensor/LaptopKuehlung_Sensor.ino) | NodeMCU 1.0 (ESP8266) | Laptop-Kühlung, Knoten 1: DHT22 misst alle 5 s, sendet die Temperatur per MQTT, LED-Ampel zeigt den Zustand. |
+| [LaptopKuehlung_Luefter](LaptopKuehlung_Luefter/LaptopKuehlung_Luefter.ino) | NodeMCU 1.0 (ESP8266) | Laptop-Kühlung, Knoten 2: schaltet den Lüfter anhand der Temperatur (mit Hysterese und Fail-safe). |
 
 ## Dependencies
 
@@ -18,7 +18,7 @@
 | Core | Version | Für | Installation |
 |---|---|---|---|
 | Arduino AVR Boards | 1.8.8 | Reaktionszeit, Temperatursensor, AnalogeDatenauslesung, Wiederstandsmessen | Bei der Arduino IDE dabei |
-| esp8266 by ESP8266 Community | 3.1.2 | TemperaturSender, LaptopKuehlungProjekt | Siehe unten |
+| esp8266 by ESP8266 Community | 3.1.2 | LaptopKuehlung_Sensor, LaptopKuehlung_Luefter | Siehe unten |
 
 ESP8266-Core installieren:
 
@@ -42,9 +42,9 @@ Der ESP8266-Core bringt `ESP8266WiFi` und `ArduinoOTA` bereits mit. Diese Biblio
 
 | Bibliothek | Version | Für | Hinweis |
 |---|---|---|---|
-| DHT sensor library (Adafruit) | 1.4.7 | Temperatursensor, TemperaturSender | |
-| Adafruit Unified Sensor | 1.1.15 | Temperatursensor, TemperaturSender | Abhängigkeit der DHT sensor library |
-| PubSubClient (Nick O'Leary) | 2.8 | TemperaturSender, LaptopKuehlungProjekt | MQTT-Client |
+| DHT sensor library (Adafruit) | 1.4.7 | Temperatursensor, LaptopKuehlung_Sensor | |
+| Adafruit Unified Sensor | 1.1.15 | Temperatursensor, LaptopKuehlung_Sensor | Abhängigkeit der DHT sensor library |
+| PubSubClient (Nick O'Leary) | 2.8 | LaptopKuehlung_Sensor, LaptopKuehlung_Luefter | MQTT-Client |
 
 Alle drei sind über **Werkzeuge → Bibliotheken verwalten** installierbar. Der Ordner `libraries/` ist per `.gitignore` vom Repository ausgeschlossen und muss auf einem neuen Rechner neu installiert werden.
 
@@ -55,7 +55,7 @@ In `libraries/` sollen nur diese drei Bibliotheken liegen. Andere Bibliotheken w
 ## Laptop-Kühlung (2 Knoten über MQTT)
 
 ```
-TemperaturSender (NodeMCU + DHT22 + Ampel)    LaptopKuehlungProjekt (NodeMCU + Lüfter)
+LaptopKuehlung_Sensor (NodeMCU + DHT22 + Ampel)    LaptopKuehlung_Luefter (NodeMCU + Lüfter)
    │  laptop/temperatur  "27.3"  ──► Broker ──►  AN ab 26.0 °C, AUS unter 25.0 °C
    └──────────── laptop/log ◄─────── Broker ◄────────┘
                        │
@@ -64,7 +64,7 @@ TemperaturSender (NodeMCU + DHT22 + Ampel)    LaptopKuehlungProjekt (NodeMCU + L
 
 ### Verdrahtung
 
-**TemperaturSender:**
+**LaptopKuehlung_Sensor:**
 
 - DHT22-Modul: `+ → 3V3`, `OUT → D5`, `− → GND`. Ein nackter 4-Pin-DHT22 (ohne Platine) braucht zusätzlich 10 kΩ von DATA nach 3V3.
 - LED-Ampel, jede LED mit ca. 220 Ω Vorwiderstand, kurzes Bein an GND: rot `D1`, gelb `D2`, grün `D6`.
@@ -76,7 +76,7 @@ TemperaturSender (NodeMCU + DHT22 + Ampel)    LaptopKuehlungProjekt (NodeMCU + L
 | rot | Temperatur > 26,0 °C |
 | rot blinkt | Sensorfehler (DHT22 liefert keinen Wert) |
 
-**LaptopKuehlungProjekt:**
+**LaptopKuehlung_Luefter:**
 
 ```
 VIN/VU (5 V) ──┬────────── Lüfter +

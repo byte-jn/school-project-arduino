@@ -1,5 +1,5 @@
 /*
-  LaptopKuehlungProjekt – Knoten 2 der Laptop-Kühlung (Lüfter)
+  LaptopKuehlung_Luefter – Knoten 2 der Laptop-Kühlung (Lüfter)
 
   Board:  NodeMCU 1.0 (ESP-12E Module), ESP8266-Core 3.1.2
   Libs:   PubSubClient
