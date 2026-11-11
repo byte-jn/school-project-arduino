@@ -32,14 +32,20 @@
   Start-Diagnose:
     - loggt Board, Pins, Verbindung, Ziel und Messintervall ("info"-Zeilen)
     - testet den Sensor einmal ("sensor_test")
-    - bis zu 2 Verbindungsversuche zum Lüfter-Uno ("connect"). Antwortet er nicht,
-      wird abgebrochen: Messung und Ampel laufen weiter, gesendet wird erst nach Reset wieder.
+    - bis zu 2 Verbindungsversuche zum Lüfter-Uno ("connect")
+
+  Verbindungsstatus:
+    unbekannt  noch nichts gesendet
+    online     letzte Nachricht bestätigt
+    unsicher   letzter Versuch fehlgeschlagen, es wird weiter versucht
+    offline    2 Fehlschläge in Folge: es wird bis zum Reset NICHT mehr gesendet,
+               Messung, Log und Ampel laufen weiter
 
   Log über USB (Serial Monitor, 9600 Baud), CSV mit Trennzeichen ;
     zeit_s;geraet;ereignis;wert;detail
   Bei jedem Senden zwei Zeilen:
     12;sensor;send;temperatur=27.3;link=online        <- Verbindungsstatus vor dem Senden
-    12;sensor;send_result;ok;18ms link=online         <- ok / abgelehnt / timeout
+    12;sensor;send_result;ok;18ms link=online         <- ok / abgelehnt / timeout / uebersprungen
 */
 
 #include <DHT.h>
@@ -60,21 +66,23 @@ const float BAD_TEMP  = 26.0;    // darüber rot
 const unsigned long MEASURE_INTERVAL_MS = 5000;   // DHT22 schafft höchstens alle 2 s eine Messung
 const unsigned long BLINK_MS = 250;
 const unsigned long ACK_TIMEOUT_MS = 200;        // so lange auf "ack" vom Lüfter-Uno warten
-const uint8_t CONNECT_ATTEMPTS = 2;              // Verbindungsversuche beim Start, dann Abbruch
+const uint8_t CONNECT_ATTEMPTS = 2;              // so viele Fehlschläge in Folge, dann offline (kein Senden mehr bis Reset)
 const unsigned long CONNECT_RETRY_MS = 1000;     // Pause zwischen den Versuchen
 const long BAUD = 9600;
 // -----------------------------------
 
-enum LinkState { LINK_UNKNOWN, LINK_ONLINE, LINK_OFFLINE };
-enum SendResult { SEND_OK, SEND_NAK, SEND_TIMEOUT };
+// unbekannt: noch nichts gesendet; unsicher: letzter Versuch fehlgeschlagen (es wird weiter versucht);
+// offline: CONNECT_ATTEMPTS Fehlschläge in Folge, es wird bis zum Reset nicht mehr gesendet.
+enum LinkState { LINK_UNKNOWN, LINK_ONLINE, LINK_UNSURE, LINK_OFFLINE };
+enum SendResult { SEND_OK, SEND_NAK, SEND_TIMEOUT, SEND_SKIPPED };
 
 DHT dht(DHT_PIN, DHT_TYPE);
 SoftwareSerial link(LINK_RX_PIN, LINK_TX_PIN);
 
 unsigned long lastMeasure = 0;
 bool sensorError = false;
-LinkState linkState = LINK_UNKNOWN;   // Ergebnis der letzten Übertragung
-bool linkAborted = false;             // true: Lüfter-Uno beim Start nicht erreichbar, es wird nicht gesendet
+LinkState linkState = LINK_UNKNOWN;
+uint8_t failedInRow = 0;              // Fehlschläge in Folge
 
 // ---------- Logging ----------
 // Schreibt "zeit_s;sensor;ereignis;" – Wert und Detail hängt der Aufrufer an.
@@ -97,12 +105,14 @@ void logSimple(const __FlashStringHelper* event, const __FlashStringHelper* valu
 const __FlashStringHelper* linkName() {
   switch (linkState) {
     case LINK_ONLINE:  return F("online");
+    case LINK_UNSURE:  return F("unsicher");
     case LINK_OFFLINE: return F("offline");
     default:           return F("unbekannt");
   }
 }
 
 // Sendet "key;value", wartet auf "ack;key" und loggt Status vorher und Ergebnis nachher.
+// Ist die Verbindung offline, wird nicht gesendet, nur geloggt.
 SendResult sendToFan(const __FlashStringHelper* key, const char* value) {
   logBegin(F("send"));
   Serial.print(key);
@@ -110,6 +120,11 @@ SendResult sendToFan(const __FlashStringHelper* key, const char* value) {
   Serial.print(value);
   Serial.print(F(";link="));
   Serial.println(linkName());
+
+  if (linkState == LINK_OFFLINE) {
+    logSimple(F("send_result"), F("uebersprungen"), F("link=offline, kein Versuch"));
+    return SEND_SKIPPED;
+  }
 
   while (link.available() > 0) {   // alte Antworten verwerfen
     link.read();
@@ -147,7 +162,13 @@ SendResult sendToFan(const __FlashStringHelper* key, const char* value) {
   }
   unsigned long ms = millis() - start;
 
-  linkState = (result == SEND_OK) ? LINK_ONLINE : LINK_OFFLINE;
+  if (result == SEND_OK) {
+    failedInRow = 0;
+    linkState = LINK_ONLINE;
+  } else {
+    failedInRow++;
+    linkState = (failedInRow >= CONNECT_ATTEMPTS) ? LINK_OFFLINE : LINK_UNSURE;
+  }
 
   logBegin(F("send_result"));
   if (result == SEND_OK) {
@@ -161,6 +182,13 @@ SendResult sendToFan(const __FlashStringHelper* key, const char* value) {
   Serial.print(ms);
   Serial.print(F("ms link="));
   Serial.println(linkName());
+
+  if (linkState == LINK_OFFLINE) {
+    logBegin(F("connect"));
+    Serial.print(F("abgebrochen;Luefter-Uno nach "));
+    Serial.print(CONNECT_ATTEMPTS);
+    Serial.println(F(" Fehlschlaegen in Folge offline, es wird nicht mehr gesendet (Reset zum Neuversuch)"));
+  }
   return result;
 }
 
@@ -201,19 +229,15 @@ void measure() {
   if (isnan(temp)) {
     setSensorError(true);
     // Jedes Mal senden, damit auch ein neu gestarteter Lüfter-Uno den Fehler mitbekommt.
-    if (!linkAborted) {
-      sendToFan(F("status"), "SENSOR_ERROR");
-    }
+    sendToFan(F("status"), "SENSOR_ERROR");
     return;
   }
   setSensorError(false);
   showTemperature(temp);
 
-  if (!linkAborted) {
-    char value[8];
-    dtostrf(temp, 1, 1, value);
-    sendToFan(F("temperatur"), value);
-  }
+  char value[8];
+  dtostrf(temp, 1, 1, value);
+  sendToFan(F("temperatur"), value);
 
   logBegin(F("temp"));
   Serial.print(temp, 1);
@@ -291,9 +315,10 @@ void testSensor() {
 }
 
 // Bis zu CONNECT_ATTEMPTS Handshakes mit dem Lüfter-Uno.
-// Antwortet er nicht, wird abgebrochen: Messung und Ampel laufen weiter, gesendet wird nicht mehr.
+// Antwortet er nicht, ist die Verbindung offline (sendToFan loggt den Abbruch):
+// Messung und Ampel laufen weiter, gesendet wird nicht mehr.
 void connectToFan() {
-  for (uint8_t attempt = 1; attempt <= CONNECT_ATTEMPTS; attempt++) {
+  for (uint8_t attempt = 1; attempt <= CONNECT_ATTEMPTS && linkState != LINK_OFFLINE; attempt++) {
     logBegin(F("connect"));
     Serial.print(F("versuch "));
     Serial.print(attempt);
@@ -305,15 +330,10 @@ void connectToFan() {
       logSimple(F("connect"), F("ok"), F("Luefter-Uno erreichbar"));
       return;
     }
-    if (attempt < CONNECT_ATTEMPTS) {
+    if (linkState != LINK_OFFLINE) {
       delay(CONNECT_RETRY_MS);
     }
   }
-  linkAborted = true;
-  logBegin(F("connect"));
-  Serial.print(F("abgebrochen;Luefter-Uno nach "));
-  Serial.print(CONNECT_ATTEMPTS);
-  Serial.println(F(" Versuchen nicht erreichbar, es wird nicht mehr gesendet (Reset zum Neuversuch)"));
 }
 
 void setup() {

@@ -123,21 +123,30 @@ zeit_s;geraet;ereignis;wert;detail
 2;sensor;sensor_test;ok;23.4 C
 2;sensor;connect;versuch 1/2;LaptopKuehlung_Luefter
 2;sensor;send;status=online;link=unbekannt
-2;sensor;send_result;timeout;200ms link=offline
+2;sensor;send_result;timeout;200ms link=unsicher
 3;sensor;connect;versuch 2/2;LaptopKuehlung_Luefter
-3;sensor;send;status=online;link=offline
+3;sensor;send;status=online;link=unsicher
 3;sensor;send_result;timeout;200ms link=offline
-3;sensor;connect;abgebrochen;Luefter-Uno nach 2 Versuchen nicht erreichbar, es wird nicht mehr gesendet (Reset zum Neuversuch)
+3;sensor;connect;abgebrochen;Luefter-Uno nach 2 Fehlschlaegen in Folge offline, es wird nicht mehr gesendet (Reset zum Neuversuch)
+8;sensor;send;temperatur=23.4;link=offline
+8;sensor;send_result;uebersprungen;link=offline, kein Versuch
 ```
 
-Nach einem Abbruch laufen Messung, Log und Ampel weiter, gesendet wird aber nicht mehr. Ein neuer Versuch startet erst nach einem Reset des Sensor-Unos. Der Lüfter-Uno geht ohne Daten nach 60 s in den Fail-safe (Lüfter AN).
+| Verbindungsstatus | Bedeutung |
+|---|---|
+| `unbekannt` | direkt nach dem Start, noch nichts gesendet |
+| `online` | letzte Nachricht wurde bestätigt |
+| `unsicher` | letzter Versuch fehlgeschlagen, es wird weiter versucht |
+| `offline` | 2 Fehlschläge in Folge (beim Start oder später): es wird **nicht mehr gesendet**, nur noch geloggt |
+
+Ist die Verbindung offline, laufen Messung, Log und Ampel weiter, aber es gibt keinen Sendeversuch mehr. Erst ein Reset des Sensor-Unos versucht es neu. Der Lüfter-Uno geht ohne Daten nach 60 s in den Fail-safe (Lüfter AN).
 
 Bei jedem Senden schreibt der Sensor-Uno zwei Zeilen:
 
 | Zeile | Inhalt |
 |---|---|
-| `send` | was gesendet wird und der Verbindungsstatus **vor** dem Senden: `online`, `offline` oder `unbekannt` (direkt nach dem Start) |
-| `send_result` | Ergebnis: `ok` (Lüfter-Uno hat mit `ack` bestätigt), `abgelehnt` (`nak`, Nachricht ungültig) oder `timeout` (keine Antwort in 200 ms, z. B. Kabel ab oder Lüfter-Uno aus), dazu Dauer und Status **danach** |
+| `send` | was gesendet werden soll und der Verbindungsstatus **vor** dem Senden |
+| `send_result` | Ergebnis: `ok` (Lüfter-Uno hat mit `ack` bestätigt), `abgelehnt` (`nak`, Nachricht ungültig), `timeout` (keine Antwort in 200 ms, z. B. Kabel ab oder Lüfter-Uno aus) oder `uebersprungen` (Verbindung offline, kein Versuch), dazu Dauer und Status **danach** |
 
 Mit echter Uhrzeit in eine Datei mitschreiben: Serial Monitor schließen (der Port kann nur einmal offen sein), dann im Repository-Ordner, je Uno mit dessen COM-Port:
 
@@ -155,4 +164,4 @@ powershell -ExecutionPolicy Bypass -File .\log-serial.ps1 -Port COM8 -File senso
 
 Den Lüfter-Uno kann man ohne Sensor-Uno testen: Ohne Daten geht er nach 60 s in den Fail-safe (Lüfter AN). Mit `OFF` im Serial Monitor schaltet er aus, mit `AUTO` wieder in den Automatikbetrieb.
 
-Den Sensor-Uno kann man ohne Lüfter-Uno testen: Messung und Ampel laufen, jedes Senden endet mit `send_result;timeout` und `link=offline`.
+Den Sensor-Uno kann man ohne Lüfter-Uno testen: Messung und Ampel laufen, die 2 Startversuche enden mit `timeout`, danach ist die Verbindung `offline` und jedes weitere Senden wird `uebersprungen`.
