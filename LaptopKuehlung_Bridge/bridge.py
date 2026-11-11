@@ -183,7 +183,9 @@ class UnoPort(threading.Thread):
         self.log = bridge.log
         self.ser: serial.Serial | None = None
         self.write_lock = threading.Lock()
+        self.seq_lock = threading.Lock()
         self.next_seq = 1
+        self.last_open_error: str | None = None
         self.pending: dict[int, tuple[float, str]] = {}
         self.pending_lock = threading.Lock()
         self.online = False
@@ -194,8 +196,10 @@ class UnoPort(threading.Thread):
         if self.ser is None or not self.ser.is_open:
             self.log.bridge("WARN", "send_skipped", ziel=self.role, typ=ftype, grund="port_geschlossen")
             return None
-        seq = self.next_seq
-        self.next_seq = self.next_seq + 1 if self.next_seq < 65535 else 1
+        # send_frame wird aus dem MQTT-Thread und dem USB-Thread aufgerufen.
+        with self.seq_lock:
+            seq = self.next_seq
+            self.next_seq = self.next_seq + 1 if self.next_seq < 65535 else 1
         frame = build_frame(ftype, seq, payload)
         if expect_ack:
             with self.pending_lock:
@@ -263,15 +267,19 @@ class UnoPort(threading.Thread):
         try:
             # Öffnen setzt den Uno zurück (DTR). Er startet neu und schickt seine Boot-Infos.
             self.ser = serial.Serial(self.port, BAUD, timeout=0.2)
+            self.last_open_error = None
             self.log.bridge("INFO", "port_open", rolle=self.role, port=self.port, baud=BAUD,
                             hinweis="Uno startet neu")
             return True
         except serial.SerialException as exc:
             text = str(exc)
-            hint = "Serial Monitor der Arduino IDE schliessen" if "Zugriff" in text or "Access" in text \
-                else "USB-Kabel und Port pruefen"
-            self.log.bridge("WARN", "port_unavailable", rolle=self.role, port=self.port,
-                            hinweis=hint, naechster_versuch_s=int(PORT_RETRY_S))
+            busy = "Zugriff" in text or "Access" in text
+            hint = "Serial Monitor der Arduino IDE schliessen" if busy else "USB-Kabel und Port pruefen"
+            # Nur beim ersten Mal bzw. wenn sich der Grund ändert loggen, nicht alle 5 s.
+            if hint != self.last_open_error:
+                self.last_open_error = hint
+                self.log.bridge("WARN", "port_unavailable", rolle=self.role, port=self.port,
+                                hinweis=hint, neuer_versuch_alle_s=int(PORT_RETRY_S))
             return False
 
     def _read_loop(self) -> None:
@@ -372,6 +380,8 @@ class Bridge:
         if msg.topic == T_HUM:
             self.last_hum = payload
             return
+        if msg.topic == T_SENSOR_STATUS:
+            self.sensor_status = payload   # auch Werte vom Broker merken (z. B. retained nach Neustart)
         if fan is None:
             return
         if msg.topic == T_TEMP:

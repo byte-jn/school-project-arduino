@@ -515,6 +515,10 @@ void handleFrame(char* body) {
       haveTemp = true;
       if (sensorState != SENSOR_OK) {
         sensorState = SENSOR_OK;   // eine gültige Temperatur heißt: Sensor ok
+        logStart(F("INFO"), F("sensor_status"));
+        kv(F("sensor"), sensorName());
+        kv(F("grund"), F("temperatur_empfangen"));
+        logEnd();
       }
       logStart(F("INFO"), F("temp"));
       kv(F("nr"), (unsigned long)seq);

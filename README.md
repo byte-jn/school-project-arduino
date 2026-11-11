@@ -45,7 +45,7 @@ Der Uno hat kein WLAN. Beide Unos hängen deshalb per USB am Laptop. Die Brücke
 
 ```
 Sensor-Uno (COM7) ──USB──┐                              ┌──USB── Lüfter-Uno (COM3)
-  DHT22 + Ampel          ▼                              ▼          Lüfter + Taster
+  DHT22 + Ampel          ▼                              ▼          Relais + 12-V-Lüfter
                     bridge.py  ◄──── MQTT ────►  Mosquitto (Docker, 127.0.0.1:1883)
                          │
                          └──► Konsole + CSV (LaptopKuehlung_Bridge/logs/) + laptop/log
@@ -108,21 +108,12 @@ Ein belegter COM-Port (z. B. Serial Monitor offen) bricht nicht ab: Die Brücke 
 
 **Lüfter-Uno (COM3):**
 
-```
-5V ────────────┬────────── Lüfter +
-               │
-         1N4007 (Ring zu 5V)
-               │
-               ├────────── Lüfter −
-               │
-         PN2222 C
-         PN2222 B ── 1 kΩ ── D9
-         PN2222 E ────────── GND
+| Bauteil | Anschluss |
+|---|---|
+| Relais-Modul (High Level Trigger) | `IN → D3`, `VCC → 5V`, `GND → GND` |
+| 12-V-Lüfter | über den Relais-Kontakt (`COM`/`NO`) an eine eigene 12-V-Versorgung |
 
-D7 ── Taster ── GND
-```
-
-PN2222: flache Seite zu dir, Beine nach unten = E – B – C. Den Lüfter nie direkt an einen Pin hängen (max. ca. 20 mA). Zwischen den beiden Unos gibt es **keine** Kabel.
+Schaltet das Relais bei LOW („Low Level Trigger“), im Sketch `FAN_ACTIVE_LOW = true` setzen. Zwischen den beiden Unos gibt es **keine** Kabel.
 
 ### Nachrichten über USB
 
@@ -170,7 +161,6 @@ Alte (retained) Temperaturen gibt die Brücke beim Start nicht an den Lüfter we
 - **Fail-safe**, der Lüfter geht AN:
   - sofort bei Sensorstatus `error` oder `offline`,
   - wenn 60 s keine Temperatur kommt (Brücke oder Sensor weg).
-- **Taster an D7:** wechselt zwischen AUTO und dauerhaft AN.
 - **MQTT:** `laptop/luefter/set` mit `ON`, `OFF` oder `AUTO`. Ohne Brücke im Serial Monitor (115200 Baud) `ON`, `OFF`, `AUTO` oder `STATUS` eintippen.
 
 Schwellen und Zeiten stehen oben im Sketch unter „Einstellungen“.
