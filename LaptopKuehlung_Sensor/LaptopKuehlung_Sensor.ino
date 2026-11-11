@@ -1,8 +1,9 @@
 /*
-  LaptopKuehlung_Sensor – Seite 1 der Laptop-Kühlung (Arduino Uno)
+  LaptopKuehlung_Sensor – Sensor-Seite der Laptop-Kühlung (Arduino Uno)
 
-  Misst die Temperatur und schickt sie per Kabel (serielle Leitung) an den
-  Lüfter-Uno (LaptopKuehlung_Luefter).
+  Misst Temperatur und Luftfeuchte und schickt sie per USB an die Laptop-Brücke
+  (LaptopKuehlung_Bridge/bridge.py). Die Brücke publiziert per MQTT und bestätigt
+  erst, wenn der Broker die Nachricht angenommen hat.
 
   Board:  Arduino Uno (AVR)
   Libs:   DHT sensor library (+ Adafruit Unified Sensor)
@@ -12,44 +13,26 @@
                   (nackter 4-Pin-Sensor: zusätzlich 10 kΩ von DATA nach 5V)
     LED-Ampel (je ca. 220 Ω Vorwiderstand, kurzes Bein an GND):
                   rot -> D13,  gelb -> D12,  grün -> D11
-    Verbindung zum Lüfter-Uno:
-                  D3 (Senden)     -> D10 am Lüfter-Uno
-                  D4 (Empfangen)  <- D11 am Lüfter-Uno   (Bestätigung "ack")
-                  GND             -> GND am Lüfter-Uno
+    USB zum Laptop (Brücke).
 
-  Anzeige:
-    grün        Temperatur <= WARN_TEMP
-    gelb        Temperatur >  WARN_TEMP
-    rot         Temperatur >  BAD_TEMP
-    rot blinkt  Sensorfehler
+  USB-Leitung (115200 Baud): Log-Zeilen und Datenrahmen gemischt.
+    Datenrahmen:  @<TYP>|<NR>|<key=wert&key=wert>*<PRUEFSUMME>
+      TYP         H = Hallo, D = Daten, S = Status, A = Bestätigung, N = Ablehnung
+      NR          laufende Nummer 1..65535; A/N wiederholen die Nummer der bestätigten Nachricht
+      PRUEFSUMME  XOR aller Zeichen zwischen '@' und '*', zwei Hex-Ziffern
+    Log-Zeilen:   zeit_ms;geraet;level;ereignis;key=wert,key=wert
+      level: DEBUG (rohe Rahmen), INFO, WARN, ERROR
 
-  Nachrichten an den Lüfter-Uno (eine Zeile pro Nachricht, 9600 Baud):
-    temperatur;27.3       alle 5 s, wenn der Sensor einen Wert liefert
-    status;SENSOR_ERROR   alle 5 s, solange der Sensor keinen Wert liefert
-    status;online         einmal beim Start
-  Der Lüfter-Uno antwortet auf jede Nachricht mit "ack;<name>" (oder "nak;..." bei Unsinn).
-
-  Start-Diagnose:
-    - loggt Board, Pins, Verbindung, Ziel und Messintervall ("info"-Zeilen)
-    - testet den Sensor einmal ("sensor_test")
-    - bis zu 2 Verbindungsversuche zum Lüfter-Uno ("connect")
-
-  Verbindungsstatus:
+  Verbindungsstatus zur Brücke:
     unbekannt  noch nichts gesendet
     online     letzte Nachricht bestätigt
     unsicher   letzter Versuch fehlgeschlagen, es wird weiter versucht
-    offline    2 Fehlschläge in Folge: es wird bis zum Reset NICHT mehr gesendet,
+    offline    MAX_FAILS Fehlschläge in Folge: bis zum Reset wird NICHT mehr gesendet,
                Messung, Log und Ampel laufen weiter
-
-  Log über USB (Serial Monitor, 9600 Baud), CSV mit Trennzeichen ;
-    zeit_s;geraet;ereignis;wert;detail
-  Bei jedem Senden zwei Zeilen:
-    12;sensor;send;temperatur=27.3;link=online        <- Verbindungsstatus vor dem Senden
-    12;sensor;send_result;ok;18ms link=online         <- ok / abgelehnt / timeout / uebersprungen
+  Startet die Brücke neu, setzt sie den Uno beim Öffnen des Ports automatisch zurück.
 */
 
 #include <DHT.h>
-#include <SoftwareSerial.h>
 
 // ---------- Einstellungen ----------
 const uint8_t DHT_PIN = 2;
@@ -57,51 +40,116 @@ const uint8_t DHT_TYPE = DHT22;
 const uint8_t LED_RED = 13;
 const uint8_t LED_YELLOW = 12;
 const uint8_t LED_GREEN = 11;
-const uint8_t LINK_TX_PIN = 3;   // Kabel zum Lüfter-Uno (D10)
-const uint8_t LINK_RX_PIN = 4;   // Kabel vom Lüfter-Uno (D11), Bestätigungen
 
-const float WARN_TEMP = 25.0;    // darüber gelb
-const float BAD_TEMP  = 26.0;    // darüber rot
+const float WARN_TEMP = 25.0;    // Ampel: darüber gelb
+const float BAD_TEMP  = 26.0;    // Ampel: darüber rot
 
 const unsigned long MEASURE_INTERVAL_MS = 5000;   // DHT22 schafft höchstens alle 2 s eine Messung
+const unsigned long STATS_INTERVAL_MS = 60000;    // Zusammenfassung im Log
 const unsigned long BLINK_MS = 250;
-const unsigned long ACK_TIMEOUT_MS = 200;        // so lange auf "ack" vom Lüfter-Uno warten
-const uint8_t CONNECT_ATTEMPTS = 2;              // so viele Fehlschläge in Folge, dann offline (kein Senden mehr bis Reset)
-const unsigned long CONNECT_RETRY_MS = 1000;     // Pause zwischen den Versuchen
-const long BAUD = 9600;
+const unsigned long ACK_TIMEOUT_MS = 1000;        // so lange auf die Bestätigung der Brücke warten
+const uint8_t MAX_FAILS = 2;                      // Fehlschläge in Folge bis "offline"
+const unsigned long CONNECT_RETRY_MS = 1000;      // Pause zwischen den Startversuchen
+const bool LOG_FRAMES = true;                     // rohe Rahmen als DEBUG loggen
+const long BAUD = 115200;
+const uint8_t PROTOCOL_VERSION = 3;
 // -----------------------------------
 
-// unbekannt: noch nichts gesendet; unsicher: letzter Versuch fehlgeschlagen (es wird weiter versucht);
-// offline: CONNECT_ATTEMPTS Fehlschläge in Folge, es wird bis zum Reset nicht mehr gesendet.
 enum LinkState { LINK_UNKNOWN, LINK_ONLINE, LINK_UNSURE, LINK_OFFLINE };
 enum SendResult { SEND_OK, SEND_NAK, SEND_TIMEOUT, SEND_SKIPPED };
 
 DHT dht(DHT_PIN, DHT_TYPE);
-SoftwareSerial link(LINK_RX_PIN, LINK_TX_PIN);
 
 unsigned long lastMeasure = 0;
+unsigned long lastStats = 0;
 bool sensorError = false;
-LinkState linkState = LINK_UNKNOWN;
-uint8_t failedInRow = 0;              // Fehlschläge in Folge
+float lastTemp = NAN;
 
-// ---------- Logging ----------
-// Schreibt "zeit_s;sensor;ereignis;" – Wert und Detail hängt der Aufrufer an.
-void logBegin(const __FlashStringHelper* event) {
-  Serial.print(millis() / 1000);
+LinkState linkState = LINK_UNKNOWN;
+uint8_t failedInRow = 0;
+uint16_t nextSeq = 1;
+
+unsigned long cntTx = 0, cntOk = 0, cntTimeout = 0, cntNak = 0, cntSkipped = 0;
+
+// =====================================================================
+// Logging: zeit_ms;sensor;LEVEL;ereignis;key=wert,key=wert
+// =====================================================================
+bool kvFirst = true;
+
+void logStart(const __FlashStringHelper* level, const __FlashStringHelper* event) {
+  Serial.print(millis());
   Serial.print(F(";sensor;"));
+  Serial.print(level);
+  Serial.print(';');
   Serial.print(event);
   Serial.print(';');
+  kvFirst = true;
 }
 
-void logSimple(const __FlashStringHelper* event, const __FlashStringHelper* value,
-               const __FlashStringHelper* detail) {
-  logBegin(event);
-  Serial.print(value);
-  Serial.print(';');
-  Serial.println(detail);
+void kvKey(const __FlashStringHelper* key) {
+  if (!kvFirst) {
+    Serial.print(',');
+  }
+  kvFirst = false;
+  Serial.print(key);
+  Serial.print('=');
 }
 
-// ---------- Verbindung zum Lüfter-Uno ----------
+void kv(const __FlashStringHelper* key, const char* value) { kvKey(key); Serial.print(value); }
+void kv(const __FlashStringHelper* key, const __FlashStringHelper* value) { kvKey(key); Serial.print(value); }
+void kv(const __FlashStringHelper* key, unsigned long value) { kvKey(key); Serial.print(value); }
+void kvTemp(const __FlashStringHelper* key, float value) { kvKey(key); Serial.print(value, 1); }
+
+void logEnd() {
+  Serial.println();
+}
+
+// =====================================================================
+// Rahmen
+// =====================================================================
+uint8_t checksum(const char* s, size_t len) {
+  uint8_t cs = 0;
+  for (size_t i = 0; i < len; i++) {
+    cs ^= (uint8_t)s[i];
+  }
+  return cs;
+}
+
+// Baut "<typ>|<seq>|<payload>*<cs>" (ohne '@') in buf.
+void buildFrame(char* buf, size_t size, char type, uint16_t seq, const char* payload) {
+  snprintf(buf, size, "%c|%u|%s", type, seq, payload);
+  size_t len = strlen(buf);
+  snprintf(buf + len, size - len, "*%02X", checksum(buf, len));
+}
+
+// Zerlegt "<typ>|<seq>|<payload>*<cs>" (ohne '@').
+// Gibt den Typ zurück oder 0 bei kaputtem Rahmen.
+char parseFrame(char* body, uint16_t& seq, char*& payload) {
+  char* star = strrchr(body, '*');
+  if (star == nullptr || strlen(star) != 3) {
+    return 0;
+  }
+  uint8_t expected = (uint8_t)strtoul(star + 1, nullptr, 16);
+  if (checksum(body, star - body) != expected) {
+    return 0;
+  }
+  *star = '\0';
+  if (body[0] == '\0' || body[1] != '|') {
+    return 0;
+  }
+  char* bar = strchr(body + 2, '|');
+  if (bar == nullptr) {
+    return 0;
+  }
+  *bar = '\0';
+  seq = (uint16_t)strtoul(body + 2, nullptr, 10);
+  payload = bar + 1;
+  return body[0];
+}
+
+// =====================================================================
+// Verbindung zur Brücke
+// =====================================================================
 const __FlashStringHelper* linkName() {
   switch (linkState) {
     case LINK_ONLINE:  return F("online");
@@ -111,88 +159,130 @@ const __FlashStringHelper* linkName() {
   }
 }
 
-// Sendet "key;value", wartet auf "ack;key" und loggt Status vorher und Ergebnis nachher.
-// Ist die Verbindung offline, wird nicht gesendet, nur geloggt.
-SendResult sendToFan(const __FlashStringHelper* key, const char* value) {
-  logBegin(F("send"));
-  Serial.print(key);
-  Serial.print('=');
-  Serial.print(value);
-  Serial.print(F(";link="));
-  Serial.println(linkName());
+// Sendet einen Rahmen an die Brücke und wartet auf "A|<seq>" bzw. "N|<seq>".
+// Loggt Status vorher und Ergebnis nachher. Ist die Verbindung offline, wird nicht gesendet.
+SendResult sendToBridge(char type, const char* payload) {
+  char typeStr[2] = { type, '\0' };
 
   if (linkState == LINK_OFFLINE) {
-    logSimple(F("send_result"), F("uebersprungen"), F("link=offline, kein Versuch"));
+    cntSkipped++;
+    logStart(F("WARN"), F("send_skipped"));
+    kv(F("typ"), typeStr);
+    kv(F("link"), linkName());
+    logEnd();
     return SEND_SKIPPED;
   }
 
-  while (link.available() > 0) {   // alte Antworten verwerfen
-    link.read();
+  uint16_t seq = nextSeq++;
+  if (nextSeq == 0) {
+    nextSeq = 1;
   }
-  link.print(key);
-  link.print(';');
-  link.println(value);
+  char frame[56];
+  buildFrame(frame, sizeof(frame), type, seq, payload);
+
+  logStart(F("INFO"), F("send"));
+  kv(F("typ"), typeStr);
+  kv(F("nr"), (unsigned long)seq);
+  kv(F("link"), linkName());
+  logEnd();
+  if (LOG_FRAMES) {
+    logStart(F("DEBUG"), F("tx"));
+    kv(F("frame"), frame);
+    logEnd();
+  }
+
+  Serial.print('@');
+  Serial.println(frame);
+  cntTx++;
 
   SendResult result = SEND_TIMEOUT;
-  char reply[24];
+  char line[48];
+  char replyRaw[48];
+  replyRaw[0] = '\0';
+  char nakReason[24];
+  nakReason[0] = '\0';
   uint8_t len = 0;
   unsigned long start = millis();
   while (result == SEND_TIMEOUT && millis() - start < ACK_TIMEOUT_MS) {
-    if (link.available() == 0) {
+    if (Serial.available() == 0) {
       continue;
     }
-    char c = link.read();
+    char c = Serial.read();
     if (c != '\n' && c != '\r') {
-      if (len < sizeof(reply) - 1) {
-        reply[len++] = c;
+      if (len < sizeof(line) - 1) {
+        line[len++] = c;
       }
       continue;
     }
     if (len == 0) {
       continue;
     }
-    reply[len] = '\0';
+    line[len] = '\0';
     len = 0;
-    if (strncmp(reply, "ack;", 4) == 0 && strcmp_P(reply + 4, (PGM_P)key) == 0) {
-      result = SEND_OK;
-    } else if (strncmp(reply, "nak;", 4) == 0) {
-      result = SEND_NAK;
+    if (line[0] != '@') {
+      continue;   // kein Rahmen
     }
-    // andere Zeilen ignorieren und weiter warten
+    strncpy(replyRaw, line + 1, sizeof(replyRaw));
+    replyRaw[sizeof(replyRaw) - 1] = '\0';
+
+    uint16_t replySeq = 0;
+    char* replyPayload = nullptr;
+    char replyType = parseFrame(line + 1, replySeq, replyPayload);
+    if (replySeq != seq) {
+      continue;   // kaputt oder Antwort auf eine andere Nachricht
+    }
+    if (replyType == 'A') {
+      result = SEND_OK;
+    } else if (replyType == 'N') {
+      result = SEND_NAK;
+      strncpy(nakReason, replyPayload, sizeof(nakReason));
+      nakReason[sizeof(nakReason) - 1] = '\0';
+    }
   }
-  unsigned long ms = millis() - start;
+  unsigned long rtt = millis() - start;
+
+  if (LOG_FRAMES && replyRaw[0] != '\0') {
+    logStart(F("DEBUG"), F("rx"));
+    kv(F("frame"), replyRaw);
+    logEnd();
+  }
 
   if (result == SEND_OK) {
     failedInRow = 0;
     linkState = LINK_ONLINE;
+    cntOk++;
+    logStart(F("INFO"), F("send_ok"));
   } else {
     failedInRow++;
-    linkState = (failedInRow >= CONNECT_ATTEMPTS) ? LINK_OFFLINE : LINK_UNSURE;
+    linkState = (failedInRow >= MAX_FAILS) ? LINK_OFFLINE : LINK_UNSURE;
+    if (result == SEND_NAK) {
+      cntNak++;
+      logStart(F("WARN"), F("send_nak"));
+    } else {
+      cntTimeout++;
+      logStart(F("WARN"), F("send_timeout"));
+    }
   }
-
-  logBegin(F("send_result"));
-  if (result == SEND_OK) {
-    Serial.print(F("ok"));
-  } else if (result == SEND_NAK) {
-    Serial.print(F("abgelehnt"));
-  } else {
-    Serial.print(F("timeout"));
+  kv(F("nr"), (unsigned long)seq);
+  kv(F("rtt_ms"), rtt);
+  kv(F("link"), linkName());
+  if (nakReason[0] != '\0') {
+    kv(F("antwort"), nakReason);
   }
-  Serial.print(';');
-  Serial.print(ms);
-  Serial.print(F("ms link="));
-  Serial.println(linkName());
+  logEnd();
 
   if (linkState == LINK_OFFLINE) {
-    logBegin(F("connect"));
-    Serial.print(F("abgebrochen;Luefter-Uno nach "));
-    Serial.print(CONNECT_ATTEMPTS);
-    Serial.println(F(" Fehlschlaegen in Folge offline, es wird nicht mehr gesendet (Reset zum Neuversuch)"));
+    logStart(F("ERROR"), F("link_offline"));
+    kv(F("fehlschlaege"), (unsigned long)failedInRow);
+    kv(F("hinweis"), F("es wird nicht mehr gesendet, Reset zum Neuversuch"));
+    logEnd();
   }
   return result;
 }
 
-// ---------- Anzeige ----------
+// =====================================================================
+// Anzeige
+// =====================================================================
 void setLeds(bool red, bool yellow, bool green) {
   digitalWrite(LED_RED, red);
   digitalWrite(LED_YELLOW, yellow);
@@ -209,17 +299,21 @@ void showTemperature(float temp) {
   }
 }
 
-// ---------- Sensor ----------
+// =====================================================================
+// Sensor
+// =====================================================================
 void setSensorError(bool error) {
   if (error == sensorError) {
     return;
   }
   sensorError = error;
   if (error) {
-    logSimple(F("sensor_status"), F("SENSOR_ERROR"), F("DHT22 liefert NaN, Verkabelung pruefen"));
+    logStart(F("WARN"), F("sensor_error"));
+    kv(F("hinweis"), F("DHT22 liefert NaN, Verkabelung pruefen"));
   } else {
-    logSimple(F("sensor_status"), F("online"), F("Sensor wieder ok"));
+    logStart(F("INFO"), F("sensor_ok"));
   }
+  logEnd();
 }
 
 void measure() {
@@ -229,105 +323,104 @@ void measure() {
   if (isnan(temp)) {
     setSensorError(true);
     // Jedes Mal senden, damit auch ein neu gestarteter Lüfter-Uno den Fehler mitbekommt.
-    sendToFan(F("status"), "SENSOR_ERROR");
+    sendToBridge('S', "sensor=error");
     return;
   }
-  setSensorError(false);
+  if (sensorError) {
+    setSensorError(false);
+    sendToBridge('S', "sensor=ok");
+  }
+  lastTemp = temp;
   showTemperature(temp);
 
-  char value[8];
-  dtostrf(temp, 1, 1, value);
-  sendToFan(F("temperatur"), value);
-
-  logBegin(F("temp"));
-  Serial.print(temp, 1);
-  Serial.print(';');
+  logStart(F("INFO"), F("measure"));
+  kvTemp(F("temp"), temp);
   if (!isnan(hum)) {
-    Serial.print(F("hum="));
-    Serial.print(hum, 0);
-    Serial.print('%');
+    kv(F("hum"), (unsigned long)(hum + 0.5));
   }
-  Serial.println();
+  logEnd();
+
+  char payload[32];
+  char tempStr[8];
+  dtostrf(temp, 1, 1, tempStr);
+  if (isnan(hum)) {
+    snprintf(payload, sizeof(payload), "temp=%s", tempStr);
+  } else {
+    snprintf(payload, sizeof(payload), "temp=%s&hum=%u", tempStr, (unsigned)(hum + 0.5));
+  }
+  sendToBridge('D', payload);
 }
 
-// ---------- Start-Diagnose ----------
-void logInfo(const __FlashStringHelper* key) {
-  logBegin(F("info"));
-  Serial.print(key);
-  Serial.print(';');
+void logStats() {
+  logStart(F("INFO"), F("stats"));
+  kv(F("gesendet"), cntTx);
+  kv(F("ok"), cntOk);
+  kv(F("timeout"), cntTimeout);
+  kv(F("abgelehnt"), cntNak);
+  kv(F("uebersprungen"), cntSkipped);
+  kv(F("link"), linkName());
+  if (!isnan(lastTemp)) {
+    kvTemp(F("temp"), lastTemp);
+  }
+  kv(F("sensor"), sensorError ? F("error") : F("ok"));
+  logEnd();
 }
 
-// Schreibt beim Start alles, was für die Fehlersuche wichtig ist.
-void logStartInfo() {
-  logInfo(F("board"));
-  Serial.println(F("Arduino Uno, Sketch LaptopKuehlung_Sensor"));
+// =====================================================================
+// Start-Diagnose
+// =====================================================================
+void logBootInfo() {
+  logStart(F("INFO"), F("boot"));
+  kv(F("board"), F("uno"));
+  kv(F("sketch"), F("LaptopKuehlung_Sensor"));
+  kv(F("protokoll"), (unsigned long)PROTOCOL_VERSION);
+  kv(F("baud"), (unsigned long)BAUD);
+  logEnd();
 
-  logInfo(F("sensor"));
-  Serial.print(F("DHT22 an D"));
-  Serial.println(DHT_PIN);
-
-  logInfo(F("ampel"));
-  Serial.print(F("rot D"));
-  Serial.print(LED_RED);
-  Serial.print(F(", gelb D"));
-  Serial.print(LED_YELLOW);
-  Serial.print(F(", gruen D"));
-  Serial.print(LED_GREEN);
-  Serial.print(F(", gelb ab "));
-  Serial.print(WARN_TEMP, 1);
-  Serial.print(F(", rot ab "));
-  Serial.println(BAD_TEMP, 1);
-
-  logInfo(F("verbindung"));
-  Serial.print(F("Kabel, SoftwareSerial "));
-  Serial.print(BAUD);
-  Serial.print(F(" Baud, Senden D"));
-  Serial.print(LINK_TX_PIN);
-  Serial.print(F(" -> Luefter D10, Empfangen D"));
-  Serial.print(LINK_RX_PIN);
-  Serial.println(F(" <- Luefter D11"));
-
-  logInfo(F("ziel"));
-  Serial.print(F("LaptopKuehlung_Luefter, ack-Timeout "));
-  Serial.print(ACK_TIMEOUT_MS);
-  Serial.print(F(" ms, "));
-  Serial.print(CONNECT_ATTEMPTS);
-  Serial.println(F(" Verbindungsversuche"));
-
-  logInfo(F("messung"));
-  Serial.print(F("alle "));
-  Serial.print(MEASURE_INTERVAL_MS / 1000);
-  Serial.println(F(" s"));
+  logStart(F("INFO"), F("config"));
+  kv(F("dht22_pin"), (unsigned long)DHT_PIN);
+  kv(F("led_rot"), (unsigned long)LED_RED);
+  kv(F("led_gelb"), (unsigned long)LED_YELLOW);
+  kv(F("led_gruen"), (unsigned long)LED_GREEN);
+  kvTemp(F("gelb_ab"), WARN_TEMP);
+  kvTemp(F("rot_ab"), BAD_TEMP);
+  kv(F("intervall_ms"), MEASURE_INTERVAL_MS);
+  kv(F("ack_timeout_ms"), ACK_TIMEOUT_MS);
+  kv(F("max_fehlschlaege"), (unsigned long)MAX_FAILS);
+  logEnd();
 }
 
-// Erste Messung, damit gleich beim Start klar ist, ob der Sensor antwortet.
 void testSensor() {
   delay(2000);   // DHT22 braucht nach dem Einschalten etwas Zeit
   float temp = dht.readTemperature();
-  logBegin(F("sensor_test"));
   if (isnan(temp)) {
-    Serial.println(F("FEHLER;DHT22 liefert NaN, Verkabelung pruefen"));
+    logStart(F("WARN"), F("sensor_test"));
+    kv(F("ergebnis"), F("fehler"));
+    kv(F("hinweis"), F("DHT22 liefert NaN, Verkabelung pruefen"));
   } else {
-    Serial.print(F("ok;"));
-    Serial.print(temp, 1);
-    Serial.println(F(" C"));
+    logStart(F("INFO"), F("sensor_test"));
+    kv(F("ergebnis"), F("ok"));
+    kvTemp(F("temp"), temp);
   }
+  logEnd();
 }
 
-// Bis zu CONNECT_ATTEMPTS Handshakes mit dem Lüfter-Uno.
-// Antwortet er nicht, ist die Verbindung offline (sendToFan loggt den Abbruch):
-// Messung und Ampel laufen weiter, gesendet wird nicht mehr.
-void connectToFan() {
-  for (uint8_t attempt = 1; attempt <= CONNECT_ATTEMPTS && linkState != LINK_OFFLINE; attempt++) {
-    logBegin(F("connect"));
-    Serial.print(F("versuch "));
-    Serial.print(attempt);
-    Serial.print('/');
-    Serial.print(CONNECT_ATTEMPTS);
-    Serial.println(F(";LaptopKuehlung_Luefter"));
+// Bis zu MAX_FAILS Hallo-Nachrichten an die Brücke. Antwortet sie nicht, ist die Verbindung offline.
+void connectToBridge() {
+  char payload[24];
+  snprintf(payload, sizeof(payload), "dev=sensor&ver=%u", PROTOCOL_VERSION);
 
-    if (sendToFan(F("status"), "online") == SEND_OK) {
-      logSimple(F("connect"), F("ok"), F("Luefter-Uno erreichbar"));
+  for (uint8_t attempt = 1; attempt <= MAX_FAILS && linkState != LINK_OFFLINE; attempt++) {
+    logStart(F("INFO"), F("connect"));
+    kv(F("ziel"), F("bridge"));
+    kv(F("versuch"), (unsigned long)attempt);
+    kv(F("von"), (unsigned long)MAX_FAILS);
+    logEnd();
+
+    if (sendToBridge('H', payload) == SEND_OK) {
+      logStart(F("INFO"), F("connect_ok"));
+      kv(F("link"), linkName());
+      logEnd();
       return;
     }
     if (linkState != LINK_OFFLINE) {
@@ -338,7 +431,6 @@ void connectToFan() {
 
 void setup() {
   Serial.begin(BAUD);
-  link.begin(BAUD);
 
   pinMode(LED_RED, OUTPUT);
   pinMode(LED_YELLOW, OUTPUT);
@@ -347,16 +439,22 @@ void setup() {
 
   dht.begin();
 
-  Serial.println(F("zeit_s;geraet;ereignis;wert;detail"));
-  logStartInfo();
+  Serial.println(F("zeit_ms;geraet;level;ereignis;details"));
+  logBootInfo();
   testSensor();
-  connectToFan();
+  connectToBridge();
+  lastStats = millis();
 }
 
 void loop() {
   if (millis() - lastMeasure >= MEASURE_INTERVAL_MS) {
     lastMeasure = millis();
     measure();
+  }
+
+  if (millis() - lastStats >= STATS_INTERVAL_MS) {
+    lastStats = millis();
+    logStats();
   }
 
   // Sensorfehler -> rote LED blinkt

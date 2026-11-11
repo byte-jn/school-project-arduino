@@ -4,3 +4,6 @@
 
 # Mitgeschriebene Logs
 *.csv
+
+# Python
+__pycache__/

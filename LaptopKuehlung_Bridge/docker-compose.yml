@@ -1,0 +1,12 @@
+# MQTT-Broker für die Laptop-Kühlung.
+# Start:  docker compose up -d      Stopp:  docker compose down
+# Der Port ist nur auf dem Laptop selbst erreichbar (127.0.0.1).
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: laptopkuehlung-mosquitto
+    ports:
+      - "127.0.0.1:1883:1883"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    restart: unless-stopped

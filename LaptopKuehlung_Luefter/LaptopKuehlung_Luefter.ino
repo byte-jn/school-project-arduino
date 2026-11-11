@@ -1,55 +1,53 @@
 /*
-  LaptopKuehlung_Luefter – Seite 2 der Laptop-Kühlung (Arduino Uno)
+  LaptopKuehlung_Luefter – Lüfter-Seite der Laptop-Kühlung (Arduino Uno)
 
-  Empfängt die Temperatur per Kabel vom Sensor-Uno (LaptopKuehlung_Sensor)
-  und schaltet den Lüfter.
+  Bekommt die Temperatur per USB von der Laptop-Brücke (LaptopKuehlung_Bridge/bridge.py),
+  die sie per MQTT vom Sensor-Uno empfängt, und schaltet den Lüfter.
 
   Board:  Arduino Uno (AVR)
   Libs:   keine zusätzlichen
 
   Verdrahtung:
-    Verbindung zum Sensor-Uno:
-      D10 (Empfangen) <- D3 am Sensor-Uno
-      D11 (Senden)    -> D4 am Sensor-Uno   (Bestätigung "ack")
-      GND             -> GND am Sensor-Uno
-    Lüfter (5 V) über NPN-Transistor PN2222:
-      5V -> Lüfter +,  Lüfter - -> Collector
-      D9 -> 1 kΩ -> Base,  Emitter -> GND
-      Diode 1N4007 parallel zum Lüfter, Ring zu 5V
-    Taster: D7 -> Taster -> GND   (interner Pull-up)
+    Relais-Modul (High Level Trigger): IN -> D3, VCC -> 5V, GND -> GND
+    12-V-Lüfter über den Relais-Kontakt (COM/NO) an eigener 12-V-Versorgung
+    USB zum Laptop (Brücke).
 
   Verhalten:
     - AUTO: Lüfter AN ab TEMP_ON, AUS unter TEMP_OFF (dazwischen bleibt der Zustand)
     - Fail-safe, Lüfter geht AN:
-        * sofort, wenn der Sensor-Uno "status;SENSOR_ERROR" schickt
-        * wenn TEMP_TIMEOUT_MS lang keine Temperatur kommt (Kabel ab, Sensor-Uno aus)
-    - Taster: wechselt zwischen AUTO und dauerhaft AN
-    - Serial Monitor (9600 Baud, Zeilenende "Neue Zeile"): ON, OFF oder AUTO eintippen
-    - bestätigt jede gültige Nachricht vom Sensor-Uno mit "ack;<name>", ungültige mit "nak;<name>"
+        * sofort, wenn der Sensor-Status nicht "ok" ist (error, offline)
+        * wenn TEMP_TIMEOUT_MS lang keine Temperatur kommt (Brücke/Sensor weg)
+    - Modus über MQTT (laptop/luefter/set) oder Serial Monitor ohne Brücke:
+      ON, OFF, AUTO, STATUS eintippen (115200 Baud, Zeilenende "Neue Zeile")
 
-  Log über USB (Serial Monitor, 9600 Baud), CSV mit Trennzeichen ;
-    zeit_s;geraet;ereignis;wert;detail
+  USB-Leitung (115200 Baud): Log-Zeilen und Datenrahmen gemischt.
+    Datenrahmen:  @<TYP>|<NR>|<key=wert&key=wert>*<PRUEFSUMME>
+      von der Brücke:  H = Hallo, T = Temperatur, S = Sensorstatus, C = Befehl (mode=...)
+      an die Brücke:   H = Hallo, S = Lüfterzustand (fan=..&mode=..&failsafe=..)
+      beide Richtungen: A = Bestätigung, N = Ablehnung (grund=...)
+      PRUEFSUMME  XOR aller Zeichen zwischen '@' und '*', zwei Hex-Ziffern
+    Log-Zeilen:   zeit_ms;geraet;level;ereignis;key=wert,key=wert
 */
 
-#include <SoftwareSerial.h>
-
 // ---------- Einstellungen ----------
-const uint8_t FAN_PIN = 9;
-const uint8_t BUTTON_PIN = 7;
-const uint8_t LINK_RX_PIN = 10;  // Kabel vom Sensor-Uno (D3)
-const uint8_t LINK_TX_PIN = 11;  // Kabel zum Sensor-Uno (D4), Bestätigungen
+const uint8_t FAN_PIN = 3;                         // Relais-Eingang (IN)
+const bool FAN_ACTIVE_LOW = false;                 // Relais ist "High Level Trigger"; true bei "Low Level Trigger"
 
-const float TEMP_ON  = 26.0;                       // ab hier Lüfter AN
-const float TEMP_OFF = 25.0;                       // darunter Lüfter AUS
+const float TEMP_ON  = 23.0;                       // ab hier Lüfter AN
+const float TEMP_OFF = 22.0;                       // darunter Lüfter AUS
 const unsigned long TEMP_TIMEOUT_MS = 60000;       // ohne neue Temperatur -> Fail-safe AN
 const unsigned long CHECK_INTERVAL_MS = 1000;
-const unsigned long DEBOUNCE_MS = 50;
-const long BAUD = 9600;
+const unsigned long STATS_INTERVAL_MS = 60000;     // Zusammenfassung im Log
+const unsigned long ACK_TIMEOUT_MS = 1000;         // so lange auf die Bestätigung der Brücke warten
+const uint8_t MAX_FAILS = 2;                       // Fehlschläge in Folge bis "offline"
+const bool LOG_FRAMES = true;                      // rohe Rahmen als DEBUG loggen
+const long BAUD = 115200;
+const uint8_t PROTOCOL_VERSION = 3;
 // -----------------------------------
 
 enum Mode { MODE_AUTO, MODE_ON, MODE_OFF };
-
-SoftwareSerial link(LINK_RX_PIN, LINK_TX_PIN);
+enum LinkState { LINK_UNKNOWN, LINK_ONLINE, LINK_UNSURE, LINK_OFFLINE };
+enum SensorState { SENSOR_UNKNOWN, SENSOR_OK, SENSOR_ERROR, SENSOR_OFFLINE };
 
 Mode mode = MODE_AUTO;
 bool fanOn = false;
@@ -58,36 +56,64 @@ bool failsafe = false;
 float lastTemp = NAN;
 unsigned long lastTempAt = 0;
 bool haveTemp = false;
-bool sensorOk = true;   // unbekannt zählt als ok; dann greift nur der Timeout
+SensorState sensorState = SENSOR_UNKNOWN;   // unbekannt zählt als ok; dann greift nur der Timeout
+
+// Verbindung zur Brücke (für die Zustandsmeldungen)
+LinkState linkState = LINK_UNKNOWN;
+uint8_t failedInRow = 0;
+uint16_t nextSeq = 1;
+uint16_t pendingSeq = 0;            // 0 = keine Meldung unterwegs
+unsigned long pendingAt = 0;
+bool stateDirty = true;             // Zustand muss (erneut) gemeldet werden
+
+// Nummern der Brücken-Rahmen
+uint16_t lastBridgeSeq = 0;
 
 unsigned long lastCheck = 0;
+unsigned long lastStats = 0;
 
-int buttonStable = HIGH;
-int buttonLastRead = HIGH;
-unsigned long buttonChangedAt = 0;
+char lineBuf[64];
+uint8_t lineLen = 0;
 
-char linkBuf[24];
-uint8_t linkLen = 0;
-char cmdBuf[8];
-uint8_t cmdLen = 0;
+unsigned long cntRx = 0, cntBad = 0, cntLost = 0, cntDup = 0;
+unsigned long cntTx = 0, cntOk = 0, cntTimeout = 0, cntNak = 0, cntSkipped = 0;
 
-// ---------- Logging ----------
-// Schreibt "zeit_s;luefter;ereignis;" – Wert und Detail hängt der Aufrufer an.
-void logBegin(const __FlashStringHelper* event) {
-  Serial.print(millis() / 1000);
+// =====================================================================
+// Logging: zeit_ms;luefter;LEVEL;ereignis;key=wert,key=wert
+// =====================================================================
+bool kvFirst = true;
+
+void logStart(const __FlashStringHelper* level, const __FlashStringHelper* event) {
+  Serial.print(millis());
   Serial.print(F(";luefter;"));
+  Serial.print(level);
+  Serial.print(';');
   Serial.print(event);
   Serial.print(';');
+  kvFirst = true;
 }
 
-void logSimple(const __FlashStringHelper* event, const __FlashStringHelper* value,
-               const __FlashStringHelper* detail) {
-  logBegin(event);
-  Serial.print(value);
-  Serial.print(';');
-  Serial.println(detail);
+void kvKey(const __FlashStringHelper* key) {
+  if (!kvFirst) {
+    Serial.print(',');
+  }
+  kvFirst = false;
+  Serial.print(key);
+  Serial.print('=');
 }
 
+void kv(const __FlashStringHelper* key, const char* value) { kvKey(key); Serial.print(value); }
+void kv(const __FlashStringHelper* key, const __FlashStringHelper* value) { kvKey(key); Serial.print(value); }
+void kv(const __FlashStringHelper* key, unsigned long value) { kvKey(key); Serial.print(value); }
+void kvTemp(const __FlashStringHelper* key, float value) { kvKey(key); Serial.print(value, 1); }
+
+void logEnd() {
+  Serial.println();
+}
+
+// =====================================================================
+// Namen
+// =====================================================================
 const __FlashStringHelper* modeName(Mode m) {
   switch (m) {
     case MODE_ON:  return F("ON");
@@ -96,61 +122,268 @@ const __FlashStringHelper* modeName(Mode m) {
   }
 }
 
-// ---------- Lüfter ----------
-// reason wird ins Log geschrieben; temp nur, wenn sie der Grund ist (sonst NAN).
-void setFan(bool on, const __FlashStringHelper* reason, float temp) {
+const __FlashStringHelper* linkName() {
+  switch (linkState) {
+    case LINK_ONLINE:  return F("online");
+    case LINK_UNSURE:  return F("unsicher");
+    case LINK_OFFLINE: return F("offline");
+    default:           return F("unbekannt");
+  }
+}
+
+const __FlashStringHelper* sensorName() {
+  switch (sensorState) {
+    case SENSOR_OK:      return F("ok");
+    case SENSOR_ERROR:   return F("error");
+    case SENSOR_OFFLINE: return F("offline");
+    default:             return F("unbekannt");
+  }
+}
+
+// =====================================================================
+// Rahmen
+// =====================================================================
+uint8_t checksum(const char* s, size_t len) {
+  uint8_t cs = 0;
+  for (size_t i = 0; i < len; i++) {
+    cs ^= (uint8_t)s[i];
+  }
+  return cs;
+}
+
+void buildFrame(char* buf, size_t size, char type, uint16_t seq, const char* payload) {
+  snprintf(buf, size, "%c|%u|%s", type, seq, payload);
+  size_t len = strlen(buf);
+  snprintf(buf + len, size - len, "*%02X", checksum(buf, len));
+}
+
+// Zerlegt "<typ>|<seq>|<payload>*<cs>" (ohne '@'). Gibt den Typ zurück oder 0 bei kaputtem Rahmen.
+char parseFrame(char* body, uint16_t& seq, char*& payload) {
+  char* star = strrchr(body, '*');
+  if (star == nullptr || strlen(star) != 3) {
+    return 0;
+  }
+  uint8_t expected = (uint8_t)strtoul(star + 1, nullptr, 16);
+  if (checksum(body, star - body) != expected) {
+    return 0;
+  }
+  *star = '\0';
+  if (body[0] == '\0' || body[1] != '|') {
+    return 0;
+  }
+  char* bar = strchr(body + 2, '|');
+  if (bar == nullptr) {
+    return 0;
+  }
+  *bar = '\0';
+  seq = (uint16_t)strtoul(body + 2, nullptr, 10);
+  payload = bar + 1;
+  return body[0];
+}
+
+// Sucht "key=wert" im Payload (Paare mit '&' getrennt) und kopiert den Wert nach out.
+bool getParam(const char* payload, const char* key, char* out, size_t size) {
+  size_t keyLen = strlen(key);
+  const char* p = payload;
+  while (*p != '\0') {
+    const char* end = strchr(p, '&');
+    size_t pairLen = end ? (size_t)(end - p) : strlen(p);
+    if (pairLen > keyLen && strncmp(p, key, keyLen) == 0 && p[keyLen] == '=') {
+      size_t valLen = pairLen - keyLen - 1;
+      if (valLen >= size) {
+        valLen = size - 1;
+      }
+      memcpy(out, p + keyLen + 1, valLen);
+      out[valLen] = '\0';
+      return true;
+    }
+    if (end == nullptr) {
+      break;
+    }
+    p = end + 1;
+  }
+  return false;
+}
+
+void writeFrame(char type, uint16_t seq, const char* payload) {
+  char frame[64];
+  buildFrame(frame, sizeof(frame), type, seq, payload);
+  Serial.print('@');
+  Serial.println(frame);
+  if (LOG_FRAMES) {
+    logStart(F("DEBUG"), F("tx"));
+    kv(F("frame"), frame);
+    logEnd();
+  }
+}
+
+void reply(bool ok, uint16_t seq, const char* reason) {
+  if (ok) {
+    writeFrame('A', seq, "");
+  } else {
+    char payload[32];
+    snprintf(payload, sizeof(payload), "grund=%s", reason);
+    writeFrame('N', seq, payload);
+  }
+}
+
+// =====================================================================
+// Zustandsmeldung an die Brücke (asynchron, eine Meldung gleichzeitig)
+// =====================================================================
+void sendStateReport() {
+  char typeStr[2] = { 'S', '\0' };
+  if (linkState == LINK_OFFLINE) {
+    cntSkipped++;
+    stateDirty = false;
+    logStart(F("WARN"), F("send_skipped"));
+    kv(F("typ"), typeStr);
+    kv(F("link"), linkName());
+    logEnd();
+    return;
+  }
+
+  char payload[48];
+  snprintf(payload, sizeof(payload), "fan=%s&mode=%s&failsafe=%u",
+           fanOn ? "ON" : "OFF",
+           mode == MODE_ON ? "ON" : (mode == MODE_OFF ? "OFF" : "AUTO"),
+           failsafe ? 1 : 0);
+
+  uint16_t seq = nextSeq++;
+  if (nextSeq == 0) {
+    nextSeq = 1;
+  }
+  logStart(F("INFO"), F("send"));
+  kv(F("typ"), typeStr);
+  kv(F("nr"), (unsigned long)seq);
+  kv(F("link"), linkName());
+  logEnd();
+
+  writeFrame('S', seq, payload);
+  cntTx++;
+  pendingSeq = seq;
+  pendingAt = millis();
+  stateDirty = false;
+}
+
+void finishPending(bool ok, bool nak, const char* reason) {
+  unsigned long rtt = millis() - pendingAt;
+  uint16_t seq = pendingSeq;
+  pendingSeq = 0;
+
+  if (ok) {
+    failedInRow = 0;
+    linkState = LINK_ONLINE;
+    cntOk++;
+    logStart(F("INFO"), F("send_ok"));
+  } else {
+    failedInRow++;
+    linkState = (failedInRow >= MAX_FAILS) ? LINK_OFFLINE : LINK_UNSURE;
+    stateDirty = true;   // Zustand nochmal melden (wird bei offline übersprungen)
+    if (nak) {
+      cntNak++;
+      logStart(F("WARN"), F("send_nak"));
+    } else {
+      cntTimeout++;
+      logStart(F("WARN"), F("send_timeout"));
+    }
+  }
+  kv(F("nr"), (unsigned long)seq);
+  kv(F("rtt_ms"), rtt);
+  kv(F("link"), linkName());
+  if (reason != nullptr && reason[0] != '\0') {
+    kv(F("antwort"), reason);
+  }
+  logEnd();
+
+  if (linkState == LINK_OFFLINE) {
+    logStart(F("ERROR"), F("link_offline"));
+    kv(F("fehlschlaege"), (unsigned long)failedInRow);
+    kv(F("hinweis"), F("Zustand wird nicht mehr gemeldet, Luefter regelt weiter"));
+    logEnd();
+  }
+}
+
+void handleReports() {
+  if (pendingSeq != 0 && millis() - pendingAt > ACK_TIMEOUT_MS) {
+    finishPending(false, false, nullptr);
+  }
+  if (pendingSeq == 0 && stateDirty) {
+    sendStateReport();
+  }
+}
+
+// =====================================================================
+// Lüfter
+// =====================================================================
+void writeFanPin(bool on) {
+  digitalWrite(FAN_PIN, (on != FAN_ACTIVE_LOW) ? HIGH : LOW);
+}
+
+void setFan(bool on, const __FlashStringHelper* reason) {
   if (on == fanOn) {
     return;
   }
   fanOn = on;
-  digitalWrite(FAN_PIN, on ? HIGH : LOW);
+  writeFanPin(on);
+  stateDirty = true;
 
-  logBegin(F("fan"));
-  Serial.print(on ? F("ON") : F("OFF"));
-  Serial.print(';');
-  Serial.print(reason);
-  if (!isnan(temp)) {
-    Serial.print(F(" temp="));
-    Serial.print(temp, 1);
+  logStart(F("INFO"), F("fan"));
+  kv(F("zustand"), on ? F("ON") : F("OFF"));
+  kv(F("grund"), reason);
+  if (!isnan(lastTemp)) {
+    kvTemp(F("temp"), lastTemp);
   }
-  Serial.println();
+  kvTemp(F("an_ab"), TEMP_ON);
+  kvTemp(F("aus_unter"), TEMP_OFF);
+  logEnd();
 }
 
 // Entscheidet anhand von Modus, Sensorstatus und letzter Temperatur.
 void updateFan() {
   if (mode == MODE_ON) {
-    setFan(true, F("modus=ON"), NAN);
+    setFan(true, F("modus_on"));
     return;
   }
   if (mode == MODE_OFF) {
-    setFan(false, F("modus=OFF"), NAN);
+    setFan(false, F("modus_off"));
     return;
   }
 
   // Beim Start zählt der Timeout ab Boot, danach ab der letzten Temperatur.
   unsigned long since = haveTemp ? lastTempAt : 0;
   bool timedOut = millis() - since > TEMP_TIMEOUT_MS;
-  bool stale = !sensorOk || timedOut;
+  bool sensorBad = (sensorState == SENSOR_ERROR || sensorState == SENSOR_OFFLINE);
+  bool stale = sensorBad || timedOut;
 
   if (stale != failsafe) {
     failsafe = stale;
-    if (!sensorOk) {
-      logSimple(F("failsafe"), F("ON"), F("sensor=SENSOR_ERROR"));
-    } else if (timedOut) {
-      logSimple(F("failsafe"), F("ON"), F("keine Temperatur seit 60s"));
+    stateDirty = true;
+    if (stale) {
+      logStart(F("WARN"), F("failsafe"));
+      kv(F("zustand"), F("ON"));
+      if (sensorBad) {
+        kv(F("grund"), F("sensor"));
+        kv(F("sensor"), sensorName());
+      } else {
+        kv(F("grund"), F("timeout"));
+        kv(F("ohne_temp_s"), TEMP_TIMEOUT_MS / 1000);
+      }
     } else {
-      logSimple(F("failsafe"), F("OFF"), F("Sensor ok, Temperatur aktuell"));
+      logStart(F("INFO"), F("failsafe"));
+      kv(F("zustand"), F("OFF"));
+      kv(F("grund"), F("temperatur_aktuell"));
     }
+    logEnd();
   }
 
   if (stale) {
-    setFan(true, F("failsafe"), NAN);
+    setFan(true, F("failsafe"));
   } else if (!haveTemp) {
     // Noch kein Wert, Timeout aber nicht abgelaufen: Zustand behalten.
   } else if (lastTemp >= TEMP_ON) {
-    setFan(true, F("temp>=26.0"), lastTemp);
+    setFan(true, F("temp_hoch"));
   } else if (lastTemp < TEMP_OFF) {
-    setFan(false, F("temp<25.0"), lastTemp);
+    setFan(false, F("temp_niedrig"));
   }
   // Zwischen TEMP_OFF und TEMP_ON bleibt der Zustand (Hysterese).
 }
@@ -160,192 +393,289 @@ void setMode(Mode m, const __FlashStringHelper* source) {
     return;
   }
   mode = m;
-  logSimple(F("mode"), modeName(mode), source);
+  stateDirty = true;
+  logStart(F("INFO"), F("mode"));
+  kv(F("modus"), modeName(mode));
+  kv(F("quelle"), source);
+  logEnd();
   updateFan();
 }
 
-// ---------- Nachrichten vom Sensor-Uno ----------
-void setSensorOk(bool ok) {
-  if (ok == sensorOk) {
-    return;
-  }
-  sensorOk = ok;
-  logSimple(F("sensor_status"), ok ? F("online") : F("SENSOR_ERROR"), F(""));
+bool parseMode(const char* s, Mode& m) {
+  if (strcasecmp(s, "ON") == 0)   { m = MODE_ON;   return true; }
+  if (strcasecmp(s, "OFF") == 0)  { m = MODE_OFF;  return true; }
+  if (strcasecmp(s, "AUTO") == 0) { m = MODE_AUTO; return true; }
+  return false;
 }
 
-// Antwort an den Sensor-Uno: "ack;<key>" oder "nak;<key>".
-void reply(bool ok, const char* key) {
-  link.print(ok ? F("ack;") : F("nak;"));
-  link.println(key);
+// =====================================================================
+// Eingehende Rahmen von der Brücke
+// =====================================================================
+void logBadFrame(const __FlashStringHelper* reason, const char* raw) {
+  cntBad++;
+  logStart(F("ERROR"), F("bad_frame"));
+  kv(F("grund"), reason);
+  kv(F("frame"), raw);
+  logEnd();
 }
 
-void handleLinkLine(char* line) {
-  char* sep = strchr(line, ';');
-  if (sep == nullptr) {
-    logBegin(F("error"));
-    Serial.print(F("invalid_link;"));
-    Serial.println(line);
-    reply(false, line);
+// Prüft die laufende Nummer der Brücke. Gibt false zurück bei einem Duplikat.
+bool checkBridgeSeq(char type, uint16_t seq) {
+  if (type == 'H' || lastBridgeSeq == 0) {
+    lastBridgeSeq = seq;
+    return true;
+  }
+  if (seq == lastBridgeSeq) {
+    cntDup++;
+    logStart(F("WARN"), F("duplikat"));
+    kv(F("nr"), (unsigned long)seq);
+    logEnd();
+    return false;
+  }
+  uint16_t expected = lastBridgeSeq + 1;
+  if (expected == 0) {
+    expected = 1;
+  }
+  if (seq != expected) {
+    uint16_t lost = seq - expected;
+    cntLost += lost;
+    logStart(F("WARN"), F("nr_luecke"));
+    kv(F("erwartet"), (unsigned long)expected);
+    kv(F("bekommen"), (unsigned long)seq);
+    kv(F("verloren"), (unsigned long)lost);
+    logEnd();
+  }
+  lastBridgeSeq = seq;
+  return true;
+}
+
+void handleFrame(char* body) {
+  char raw[64];
+  strncpy(raw, body, sizeof(raw));
+  raw[sizeof(raw) - 1] = '\0';
+  if (LOG_FRAMES) {
+    logStart(F("DEBUG"), F("rx"));
+    kv(F("frame"), raw);
+    logEnd();
+  }
+
+  uint16_t seq = 0;
+  char* payload = nullptr;
+  char type = parseFrame(body, seq, payload);
+  if (type == 0) {
+    reply(false, seq, "checksum");
+    logBadFrame(F("checksum_oder_format"), raw);
     return;
   }
-  *sep = '\0';
-  const char* key = line;
-  const char* value = sep + 1;
 
-  if (strcmp(key, "temperatur") == 0) {
-    char* end;
-    double t = strtod(value, &end);
-    if (end == value) {
-      logBegin(F("error"));
-      Serial.print(F("invalid_temp;"));
-      Serial.println(value);
-      reply(false, key);
+  // Antworten auf unsere Zustandsmeldung
+  if (type == 'A' || type == 'N') {
+    if (pendingSeq != 0 && seq == pendingSeq) {
+      char reason[24] = "";
+      if (type == 'N') {
+        getParam(payload, "grund", reason, sizeof(reason));
+      }
+      finishPending(type == 'A', type == 'N', reason);
+    }
+    return;
+  }
+
+  cntRx++;
+  if (!checkBridgeSeq(type, seq)) {
+    reply(true, seq, "");   // Duplikat: nochmal bestätigen, aber nicht erneut verarbeiten
+    return;
+  }
+
+  char value[16];
+  switch (type) {
+    case 'H': {
+      reply(true, seq, "");
+      logStart(F("INFO"), F("hallo"));
+      kv(F("von"), getParam(payload, "dev", value, sizeof(value)) ? value : "?");
+      logEnd();
+      stateDirty = true;   // Brücke kennt unseren Zustand noch nicht
       return;
     }
-    reply(true, key);
-    lastTemp = t;
-    lastTempAt = millis();
-    haveTemp = true;
-    setSensorOk(true);   // eine gültige Temperatur heißt: Sensor ok
-    updateFan();
-  } else if (strcmp(key, "status") == 0) {
-    reply(true, key);
-    setSensorOk(strcmp(value, "online") == 0);
-    updateFan();         // bei SENSOR_ERROR sofort Fail-safe
-  } else {
-    logBegin(F("error"));
-    Serial.print(F("invalid_link;"));
-    Serial.println(key);
-    reply(false, key);
-  }
-}
-
-// Liest Zeilen vom Sensor-Uno, ohne zu blockieren.
-void handleLink() {
-  while (link.available() > 0) {
-    char c = link.read();
-    if (c == '\n' || c == '\r') {
-      if (linkLen > 0) {
-        linkBuf[linkLen] = '\0';
-        handleLinkLine(linkBuf);
-        linkLen = 0;
+    case 'T': {
+      if (!getParam(payload, "temp", value, sizeof(value))) {
+        reply(false, seq, "temp_fehlt");
+        logBadFrame(F("temp_fehlt"), raw);
+        return;
       }
-    } else if (linkLen < sizeof(linkBuf) - 1) {
-      linkBuf[linkLen++] = c;
+      char* end;
+      double t = strtod(value, &end);
+      if (end == value) {
+        reply(false, seq, "temp_ungueltig");
+        logBadFrame(F("temp_ungueltig"), raw);
+        return;
+      }
+      reply(true, seq, "");
+      lastTemp = t;
+      lastTempAt = millis();
+      haveTemp = true;
+      if (sensorState != SENSOR_OK) {
+        sensorState = SENSOR_OK;   // eine gültige Temperatur heißt: Sensor ok
+      }
+      logStart(F("INFO"), F("temp"));
+      kv(F("nr"), (unsigned long)seq);
+      kvTemp(F("temp"), lastTemp);
+      if (getParam(payload, "hum", value, sizeof(value))) {
+        kv(F("hum"), value);
+      }
+      logEnd();
+      updateFan();
+      return;
     }
+    case 'S': {
+      if (!getParam(payload, "sensor", value, sizeof(value))) {
+        reply(false, seq, "sensor_fehlt");
+        logBadFrame(F("sensor_fehlt"), raw);
+        return;
+      }
+      reply(true, seq, "");
+      SensorState s = SENSOR_UNKNOWN;
+      if (strcmp(value, "ok") == 0) {
+        s = SENSOR_OK;
+      } else if (strcmp(value, "error") == 0) {
+        s = SENSOR_ERROR;
+      } else if (strcmp(value, "offline") == 0) {
+        s = SENSOR_OFFLINE;
+      }
+      if (s != sensorState) {
+        sensorState = s;
+        logStart(s == SENSOR_OK ? F("INFO") : F("WARN"), F("sensor_status"));
+        kv(F("sensor"), sensorName());
+        logEnd();
+      }
+      updateFan();   // bei error/offline sofort Fail-safe
+      return;
+    }
+    case 'C': {
+      Mode m;
+      if (!getParam(payload, "mode", value, sizeof(value)) || !parseMode(value, m)) {
+        reply(false, seq, "befehl_ungueltig");
+        logBadFrame(F("befehl_ungueltig"), raw);
+        return;
+      }
+      reply(true, seq, "");
+      setMode(m, F("mqtt"));
+      stateDirty = true;
+      return;
+    }
+    default:
+      reply(false, seq, "typ_unbekannt");
+      logBadFrame(F("typ_unbekannt"), raw);
+      return;
   }
 }
 
-// ---------- Eingaben ----------
-// Taster schaltet zwischen AUTO und dauerhaft AN.
-void handleButton() {
-  int reading = digitalRead(BUTTON_PIN);
-  if (reading != buttonLastRead) {
-    buttonLastRead = reading;
-    buttonChangedAt = millis();
+// =====================================================================
+// Eingaben
+// =====================================================================
+void logStats() {
+  logStart(F("INFO"), F("stats"));
+  kv(F("empfangen"), cntRx);
+  kv(F("fehlerhaft"), cntBad);
+  kv(F("verloren"), cntLost);
+  kv(F("duplikate"), cntDup);
+  kv(F("gemeldet"), cntTx);
+  kv(F("bestaetigt"), cntOk);
+  kv(F("timeout"), cntTimeout);
+  kv(F("link"), linkName());
+  kv(F("luefter"), fanOn ? F("ON") : F("OFF"));
+  kv(F("modus"), modeName(mode));
+  kv(F("failsafe"), failsafe ? F("ON") : F("OFF"));
+  kv(F("sensor"), sensorName());
+  if (haveTemp) {
+    kvTemp(F("temp"), lastTemp);
+    kv(F("temp_alter_s"), (millis() - lastTempAt) / 1000);
   }
-  if (millis() - buttonChangedAt > DEBOUNCE_MS && reading != buttonStable) {
-    buttonStable = reading;
-    if (buttonStable == LOW) {  // gedrückt
-      setMode(mode == MODE_AUTO ? MODE_ON : MODE_AUTO, F("taster"));
-    }
-  }
+  logEnd();
 }
 
+// Textbefehle aus dem Serial Monitor (wenn keine Brücke läuft).
 void handleCommand(const char* cmd) {
-  if (strcasecmp(cmd, "ON") == 0) {
-    setMode(MODE_ON, F("serial"));
-  } else if (strcasecmp(cmd, "OFF") == 0) {
-    setMode(MODE_OFF, F("serial"));
-  } else if (strcasecmp(cmd, "AUTO") == 0) {
-    setMode(MODE_AUTO, F("serial"));
+  Mode m;
+  if (parseMode(cmd, m)) {
+    setMode(m, F("serial"));
+  } else if (strcasecmp(cmd, "STATUS") == 0) {
+    logStats();
   } else {
-    logBegin(F("error"));
-    Serial.print(F("invalid_command;"));
-    Serial.println(cmd);
+    logStart(F("WARN"), F("invalid_command"));
+    kv(F("befehl"), cmd);
+    logEnd();
   }
 }
 
-// Liest Befehle aus dem Serial Monitor, ohne zu blockieren.
+// Liest Zeilen von USB: '@...' sind Rahmen, alles andere Textbefehle.
 void handleSerial() {
   while (Serial.available() > 0) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
-      if (cmdLen > 0) {
-        cmdBuf[cmdLen] = '\0';
-        handleCommand(cmdBuf);
-        cmdLen = 0;
+      if (lineLen > 0) {
+        lineBuf[lineLen] = '\0';
+        if (lineBuf[0] == '@') {
+          handleFrame(lineBuf + 1);
+        } else {
+          handleCommand(lineBuf);
+        }
+        lineLen = 0;
       }
-    } else if (cmdLen < sizeof(cmdBuf) - 1) {
-      cmdBuf[cmdLen++] = c;
+    } else if (lineLen < sizeof(lineBuf) - 1) {
+      lineBuf[lineLen++] = c;
     }
   }
 }
 
-// ---------- Start-Diagnose ----------
-void logInfo(const __FlashStringHelper* key) {
-  logBegin(F("info"));
-  Serial.print(key);
-  Serial.print(';');
-}
+// =====================================================================
+// Start
+// =====================================================================
+void logBootInfo() {
+  logStart(F("INFO"), F("boot"));
+  kv(F("board"), F("uno"));
+  kv(F("sketch"), F("LaptopKuehlung_Luefter"));
+  kv(F("protokoll"), (unsigned long)PROTOCOL_VERSION);
+  kv(F("baud"), (unsigned long)BAUD);
+  logEnd();
 
-// Schreibt beim Start alles, was für die Fehlersuche wichtig ist.
-void logStartInfo() {
-  logInfo(F("board"));
-  Serial.println(F("Arduino Uno, Sketch LaptopKuehlung_Luefter"));
-
-  logInfo(F("luefter"));
-  Serial.print(F("PN2222 an D"));
-  Serial.println(FAN_PIN);
-
-  logInfo(F("taster"));
-  Serial.print(F("D"));
-  Serial.print(BUTTON_PIN);
-  Serial.println(F(" gegen GND, AUTO <-> ON"));
-
-  logInfo(F("verbindung"));
-  Serial.print(F("Kabel, SoftwareSerial "));
-  Serial.print(BAUD);
-  Serial.print(F(" Baud, Empfangen D"));
-  Serial.print(LINK_RX_PIN);
-  Serial.print(F(" <- Sensor D3, Senden D"));
-  Serial.print(LINK_TX_PIN);
-  Serial.println(F(" -> Sensor D4"));
-
-  logInfo(F("schwellen"));
-  Serial.print(F("AN ab "));
-  Serial.print(TEMP_ON, 1);
-  Serial.print(F(", AUS unter "));
-  Serial.print(TEMP_OFF, 1);
-  Serial.print(F(", Fail-safe nach "));
-  Serial.print(TEMP_TIMEOUT_MS / 1000);
-  Serial.println(F(" s ohne Temperatur"));
-
-  logInfo(F("befehle"));
-  Serial.println(F("ON, OFF, AUTO (Serial Monitor, Zeilenende Neue Zeile)"));
-
-  logSimple(F("start"), F("AUTO"), F("warte auf Sensor-Uno"));
+  logStart(F("INFO"), F("config"));
+  kv(F("luefter_pin"), (unsigned long)FAN_PIN);
+  kv(F("aktiv"), FAN_ACTIVE_LOW ? F("LOW") : F("HIGH"));
+  kvTemp(F("an_ab"), TEMP_ON);
+  kvTemp(F("aus_unter"), TEMP_OFF);
+  kv(F("failsafe_nach_s"), TEMP_TIMEOUT_MS / 1000);
+  kv(F("ack_timeout_ms"), ACK_TIMEOUT_MS);
+  kv(F("max_fehlschlaege"), (unsigned long)MAX_FAILS);
+  logEnd();
 }
 
 void setup() {
   Serial.begin(BAUD);
-  link.begin(BAUD);
 
+  writeFanPin(false);          // erst Pegel setzen, dann Ausgang: Relais zuckt beim Start nicht
   pinMode(FAN_PIN, OUTPUT);
-  digitalWrite(FAN_PIN, LOW);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  Serial.println(F("zeit_s;geraet;ereignis;wert;detail"));
-  logStartInfo();
+  Serial.println(F("zeit_ms;geraet;level;ereignis;details"));
+  logBootInfo();
+
+  char payload[24];
+  snprintf(payload, sizeof(payload), "dev=luefter&ver=%u", PROTOCOL_VERSION);
+  writeFrame('H', 0, payload);   // Hallo ohne Bestätigung; die Brücke erkennt daran die Rolle
+
+  lastStats = millis();
 }
 
 void loop() {
-  handleLink();
   handleSerial();
-  handleButton();
+  handleReports();
 
   if (millis() - lastCheck >= CHECK_INTERVAL_MS) {
     lastCheck = millis();
     updateFan();
+  }
+
+  if (millis() - lastStats >= STATS_INTERVAL_MS) {
+    lastStats = millis();
+    logStats();
   }
 }
