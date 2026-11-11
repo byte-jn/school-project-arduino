@@ -10,6 +10,7 @@
   Verdrahtung:
     Verbindung zum Sensor-Uno:
       D10 (Empfangen) <- D3 am Sensor-Uno
+      D11 (Senden)    -> D4 am Sensor-Uno   (Bestätigung "ack")
       GND             -> GND am Sensor-Uno
     Lüfter (5 V) über NPN-Transistor PN2222:
       5V -> Lüfter +,  Lüfter - -> Collector
@@ -24,6 +25,7 @@
         * wenn TEMP_TIMEOUT_MS lang keine Temperatur kommt (Kabel ab, Sensor-Uno aus)
     - Taster: wechselt zwischen AUTO und dauerhaft AN
     - Serial Monitor (9600 Baud, Zeilenende "Neue Zeile"): ON, OFF oder AUTO eintippen
+    - bestätigt jede gültige Nachricht vom Sensor-Uno mit "ack;<name>", ungültige mit "nak;<name>"
 
   Log über USB (Serial Monitor, 9600 Baud), CSV mit Trennzeichen ;
     zeit_s;geraet;ereignis;wert;detail
@@ -35,7 +37,7 @@
 const uint8_t FAN_PIN = 9;
 const uint8_t BUTTON_PIN = 7;
 const uint8_t LINK_RX_PIN = 10;  // Kabel vom Sensor-Uno (D3)
-const uint8_t LINK_TX_PIN = 11;  // nicht angeschlossen, SoftwareSerial braucht einen Pin
+const uint8_t LINK_TX_PIN = 11;  // Kabel zum Sensor-Uno (D4), Bestätigungen
 
 const float TEMP_ON  = 26.0;                       // ab hier Lüfter AN
 const float TEMP_OFF = 25.0;                       // darunter Lüfter AUS
@@ -171,12 +173,19 @@ void setSensorOk(bool ok) {
   logSimple(F("sensor_status"), ok ? F("online") : F("SENSOR_ERROR"), F(""));
 }
 
+// Antwort an den Sensor-Uno: "ack;<key>" oder "nak;<key>".
+void reply(bool ok, const char* key) {
+  link.print(ok ? F("ack;") : F("nak;"));
+  link.println(key);
+}
+
 void handleLinkLine(char* line) {
   char* sep = strchr(line, ';');
   if (sep == nullptr) {
     logBegin(F("error"));
     Serial.print(F("invalid_link;"));
     Serial.println(line);
+    reply(false, line);
     return;
   }
   *sep = '\0';
@@ -190,20 +199,24 @@ void handleLinkLine(char* line) {
       logBegin(F("error"));
       Serial.print(F("invalid_temp;"));
       Serial.println(value);
+      reply(false, key);
       return;
     }
+    reply(true, key);
     lastTemp = t;
     lastTempAt = millis();
     haveTemp = true;
     setSensorOk(true);   // eine gültige Temperatur heißt: Sensor ok
     updateFan();
   } else if (strcmp(key, "status") == 0) {
+    reply(true, key);
     setSensorOk(strcmp(value, "online") == 0);
     updateFan();         // bei SENSOR_ERROR sofort Fail-safe
   } else {
     logBegin(F("error"));
     Serial.print(F("invalid_link;"));
     Serial.println(key);
+    reply(false, key);
   }
 }
 
@@ -269,6 +282,51 @@ void handleSerial() {
   }
 }
 
+// ---------- Start-Diagnose ----------
+void logInfo(const __FlashStringHelper* key) {
+  logBegin(F("info"));
+  Serial.print(key);
+  Serial.print(';');
+}
+
+// Schreibt beim Start alles, was für die Fehlersuche wichtig ist.
+void logStartInfo() {
+  logInfo(F("board"));
+  Serial.println(F("Arduino Uno, Sketch LaptopKuehlung_Luefter"));
+
+  logInfo(F("luefter"));
+  Serial.print(F("PN2222 an D"));
+  Serial.println(FAN_PIN);
+
+  logInfo(F("taster"));
+  Serial.print(F("D"));
+  Serial.print(BUTTON_PIN);
+  Serial.println(F(" gegen GND, AUTO <-> ON"));
+
+  logInfo(F("verbindung"));
+  Serial.print(F("Kabel, SoftwareSerial "));
+  Serial.print(BAUD);
+  Serial.print(F(" Baud, Empfangen D"));
+  Serial.print(LINK_RX_PIN);
+  Serial.print(F(" <- Sensor D3, Senden D"));
+  Serial.print(LINK_TX_PIN);
+  Serial.println(F(" -> Sensor D4"));
+
+  logInfo(F("schwellen"));
+  Serial.print(F("AN ab "));
+  Serial.print(TEMP_ON, 1);
+  Serial.print(F(", AUS unter "));
+  Serial.print(TEMP_OFF, 1);
+  Serial.print(F(", Fail-safe nach "));
+  Serial.print(TEMP_TIMEOUT_MS / 1000);
+  Serial.println(F(" s ohne Temperatur"));
+
+  logInfo(F("befehle"));
+  Serial.println(F("ON, OFF, AUTO (Serial Monitor, Zeilenende Neue Zeile)"));
+
+  logSimple(F("start"), F("AUTO"), F("warte auf Sensor-Uno"));
+}
+
 void setup() {
   Serial.begin(BAUD);
   link.begin(BAUD);
@@ -278,7 +336,7 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   Serial.println(F("zeit_s;geraet;ereignis;wert;detail"));
-  logSimple(F("start"), F("AUTO"), F("Befehle: ON, OFF, AUTO"));
+  logStartInfo();
 }
 
 void loop() {
