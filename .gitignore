@@ -1,3 +1,6 @@
 *libraries
 # WLAN-/MQTT-Zugangsdaten pro Sketch
 **/secrets.h
+
+# Mitgeschriebene Logs
+*.csv

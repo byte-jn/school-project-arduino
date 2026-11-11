@@ -1,65 +1,53 @@
 /*
-  LaptopKuehlung_Luefter – Knoten 2 der Laptop-Kühlung (Lüfter)
+  LaptopKuehlung_Luefter – Seite 2 der Laptop-Kühlung (Arduino Uno)
 
-  Board:  NodeMCU 1.0 (ESP-12E Module), ESP8266-Core 3.1.2
-  Libs:   PubSubClient
+  Empfängt die Temperatur per Kabel vom Sensor-Uno (LaptopKuehlung_Sensor)
+  und schaltet den Lüfter.
+
+  Board:  Arduino Uno (AVR)
+  Libs:   keine zusätzlichen
 
   Verdrahtung:
-    Lüfter (5 V) über NPN-Transistor PN2222 an D6 (GPIO12):
-      VIN/VU (5 V) -> Lüfter +      Lüfter - -> Collector
-      D6 -> 1 kΩ -> Base            Emitter -> GND
-      Diode 1N4007 parallel zum Lüfter, Ring zu +5 V
-    Taster: D1 (GPIO5) -> Taster -> GND   (interner Pull-up)
+    Verbindung zum Sensor-Uno:
+      D10 (Empfangen) <- D3 am Sensor-Uno
+      GND             -> GND am Sensor-Uno
+    Lüfter (5 V) über NPN-Transistor PN2222:
+      5V -> Lüfter +,  Lüfter - -> Collector
+      D9 -> 1 kΩ -> Base,  Emitter -> GND
+      Diode 1N4007 parallel zum Lüfter, Ring zu 5V
+    Taster: D7 -> Taster -> GND   (interner Pull-up)
 
-  Funktion:
-    - empfängt die Temperatur über  <prefix>temperatur
-    - AUTO:  Lüfter AN ab TEMP_ON, AUS unter TEMP_OFF (dazwischen bleibt der Zustand)
+  Verhalten:
+    - AUTO: Lüfter AN ab TEMP_ON, AUS unter TEMP_OFF (dazwischen bleibt der Zustand)
     - Fail-safe, Lüfter geht AN:
-        * sofort, wenn  <prefix>sensor/status  nicht "online" ist (SENSOR_ERROR, offline)
-        * wenn TEMP_TIMEOUT_MS lang keine Temperatur kommt
-    - Modus über  <prefix>luefter/set  ("ON", "OFF", "AUTO") oder Taster (AUTO <-> ON)
-    - meldet  <prefix>luefter/status  (ON/OFF) und  <prefix>luefter/mode  (retained)
-    - schreibt Zustandswechsel als CSV-Zeile nach Serial und  <prefix>log
+        * sofort, wenn der Sensor-Uno "status;SENSOR_ERROR" schickt
+        * wenn TEMP_TIMEOUT_MS lang keine Temperatur kommt (Kabel ab, Sensor-Uno aus)
+    - Taster: wechselt zwischen AUTO und dauerhaft AN
+    - Serial Monitor (9600 Baud, Zeilenende "Neue Zeile"): ON, OFF oder AUTO eintippen
 
-  Zugangsdaten: secrets.example.h nach secrets.h kopieren und ausfüllen.
+  Log über USB (Serial Monitor, 9600 Baud), CSV mit Trennzeichen ;
+    zeit_s;geraet;ereignis;wert;detail
 */
 
-#include <ESP8266WiFi.h>
-#include <ArduinoOTA.h>
-#include <PubSubClient.h>
-#include <time.h>
-#include "secrets.h"
+#include <SoftwareSerial.h>
 
 // ---------- Einstellungen ----------
-// Muss in beiden Sketches gleich sein.
-#define TOPIC_PREFIX "laptop/"
-
-const char* DEVICE_NAME = "luefter";
-const uint8_t FAN_PIN = D6;
-const uint8_t BUTTON_PIN = D1;
+const uint8_t FAN_PIN = 9;
+const uint8_t BUTTON_PIN = 7;
+const uint8_t LINK_RX_PIN = 10;  // Kabel vom Sensor-Uno (D3)
+const uint8_t LINK_TX_PIN = 11;  // nicht angeschlossen, SoftwareSerial braucht einen Pin
 
 const float TEMP_ON  = 26.0;                       // ab hier Lüfter AN
 const float TEMP_OFF = 25.0;                       // darunter Lüfter AUS
 const unsigned long TEMP_TIMEOUT_MS = 60000;       // ohne neue Temperatur -> Fail-safe AN
 const unsigned long CHECK_INTERVAL_MS = 1000;
-const unsigned long MQTT_RETRY_MS = 5000;
 const unsigned long DEBOUNCE_MS = 50;
-
-const char* TOPIC_TEMP          = TOPIC_PREFIX "temperatur";
-const char* TOPIC_SENSOR_STATUS = TOPIC_PREFIX "sensor/status";
-const char* TOPIC_SET           = TOPIC_PREFIX "luefter/set";
-const char* TOPIC_FAN_STATUS    = TOPIC_PREFIX "luefter/status";
-const char* TOPIC_MODE          = TOPIC_PREFIX "luefter/mode";
-const char* TOPIC_ONLINE        = TOPIC_PREFIX "luefter/online";
-const char* TOPIC_LOG           = TOPIC_PREFIX "log";
-
-const char* NTP_TZ = "CET-1CEST,M3.5.0,M10.5.0/3";  // Mitteleuropa inkl. Sommerzeit
+const long BAUD = 9600;
 // -----------------------------------
 
 enum Mode { MODE_AUTO, MODE_ON, MODE_OFF };
 
-WiFiClient wifiClient;
-PubSubClient mqtt(wifiClient);
+SoftwareSerial link(LINK_RX_PIN, LINK_TX_PIN);
 
 Mode mode = MODE_AUTO;
 bool fanOn = false;
@@ -68,71 +56,72 @@ bool failsafe = false;
 float lastTemp = NAN;
 unsigned long lastTempAt = 0;
 bool haveTemp = false;
-
-// Letzter Status des Sensors. Unbekannt zählt als ok; dann greift nur der Timeout.
-String sensorStatus = "unbekannt";
-bool sensorOk = true;
+bool sensorOk = true;   // unbekannt zählt als ok; dann greift nur der Timeout
 
 unsigned long lastCheck = 0;
-unsigned long lastMqttAttempt = 0;
 
 int buttonStable = HIGH;
 int buttonLastRead = HIGH;
 unsigned long buttonChangedAt = 0;
 
-const char* modeName(Mode m) {
+char linkBuf[24];
+uint8_t linkLen = 0;
+char cmdBuf[8];
+uint8_t cmdLen = 0;
+
+// ---------- Logging ----------
+// Schreibt "zeit_s;luefter;ereignis;" – Wert und Detail hängt der Aufrufer an.
+void logBegin(const __FlashStringHelper* event) {
+  Serial.print(millis() / 1000);
+  Serial.print(F(";luefter;"));
+  Serial.print(event);
+  Serial.print(';');
+}
+
+void logSimple(const __FlashStringHelper* event, const __FlashStringHelper* value,
+               const __FlashStringHelper* detail) {
+  logBegin(event);
+  Serial.print(value);
+  Serial.print(';');
+  Serial.println(detail);
+}
+
+const __FlashStringHelper* modeName(Mode m) {
   switch (m) {
-    case MODE_ON:  return "ON";
-    case MODE_OFF: return "OFF";
-    default:       return "AUTO";
+    case MODE_ON:  return F("ON");
+    case MODE_OFF: return F("OFF");
+    default:       return F("AUTO");
   }
 }
 
-// Zeitstempel "YYYY-MM-DD HH:MM:SS"; ohne NTP-Zeit die Laufzeit seit dem Start.
-String timestamp() {
-  time_t now = time(nullptr);
-  if (now < 1700000000) {
-    return "uptime " + String(millis() / 1000) + "s";
-  }
-  struct tm t;
-  localtime_r(&now, &t);
-  char buf[20];
-  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
-  return String(buf);
-}
-
-// Eine CSV-Zeile: zeit;gerät;ereignis;wert;detail
-void logEvent(const char* event, const String& value, const String& detail = "") {
-  String line = timestamp() + ";" + DEVICE_NAME + ";" + event + ";" + value + ";" + detail;
-  Serial.println(line);
-  if (mqtt.connected()) {
-    mqtt.publish(TOPIC_LOG, line.c_str());
-  }
-}
-
-void publishState() {
-  mqtt.publish(TOPIC_FAN_STATUS, fanOn ? "ON" : "OFF", true);
-  mqtt.publish(TOPIC_MODE, modeName(mode), true);
-}
-
-void setFan(bool on, const String& reason) {
+// ---------- Lüfter ----------
+// reason wird ins Log geschrieben; temp nur, wenn sie der Grund ist (sonst NAN).
+void setFan(bool on, const __FlashStringHelper* reason, float temp) {
   if (on == fanOn) {
     return;
   }
   fanOn = on;
   digitalWrite(FAN_PIN, on ? HIGH : LOW);
-  publishState();
-  logEvent("fan", on ? "ON" : "OFF", reason);
+
+  logBegin(F("fan"));
+  Serial.print(on ? F("ON") : F("OFF"));
+  Serial.print(';');
+  Serial.print(reason);
+  if (!isnan(temp)) {
+    Serial.print(F(" temp="));
+    Serial.print(temp, 1);
+  }
+  Serial.println();
 }
 
-// Entscheidet anhand von Modus und letzter Temperatur, ob der Lüfter laufen soll.
+// Entscheidet anhand von Modus, Sensorstatus und letzter Temperatur.
 void updateFan() {
   if (mode == MODE_ON) {
-    setFan(true, "modus=ON");
+    setFan(true, F("modus=ON"), NAN);
     return;
   }
   if (mode == MODE_OFF) {
-    setFan(false, "modus=OFF");
+    setFan(false, F("modus=OFF"), NAN);
     return;
   }
 
@@ -143,105 +132,98 @@ void updateFan() {
 
   if (stale != failsafe) {
     failsafe = stale;
-    String reason;
     if (!sensorOk) {
-      reason = "sensor=" + sensorStatus;
+      logSimple(F("failsafe"), F("ON"), F("sensor=SENSOR_ERROR"));
     } else if (timedOut) {
-      reason = "keine Temperatur seit " + String(TEMP_TIMEOUT_MS / 1000) + "s";
+      logSimple(F("failsafe"), F("ON"), F("keine Temperatur seit 60s"));
     } else {
-      reason = "Sensor ok, Temperatur aktuell";
+      logSimple(F("failsafe"), F("OFF"), F("Sensor ok, Temperatur aktuell"));
     }
-    logEvent("failsafe", stale ? "ON" : "OFF", reason);
   }
 
   if (stale) {
-    setFan(true, "failsafe");
+    setFan(true, F("failsafe"), NAN);
   } else if (!haveTemp) {
     // Noch kein Wert, Timeout aber nicht abgelaufen: Zustand behalten.
   } else if (lastTemp >= TEMP_ON) {
-    setFan(true, "temp=" + String(lastTemp, 1) + ">=" + String(TEMP_ON, 1));
+    setFan(true, F("temp>=26.0"), lastTemp);
   } else if (lastTemp < TEMP_OFF) {
-    setFan(false, "temp=" + String(lastTemp, 1) + "<" + String(TEMP_OFF, 1));
+    setFan(false, F("temp<25.0"), lastTemp);
   }
   // Zwischen TEMP_OFF und TEMP_ON bleibt der Zustand (Hysterese).
 }
 
-void setMode(Mode m, const char* source) {
+void setMode(Mode m, const __FlashStringHelper* source) {
   if (m == mode) {
     return;
   }
   mode = m;
-  mqtt.publish(TOPIC_MODE, modeName(mode), true);
-  logEvent("mode", modeName(mode), source);
+  logSimple(F("mode"), modeName(mode), source);
   updateFan();
 }
 
-void onMessage(char* topic, byte* payload, unsigned int length) {
-  char msg[16];
-  unsigned int n = length < sizeof(msg) - 1 ? length : sizeof(msg) - 1;
-  memcpy(msg, payload, n);
-  msg[n] = '\0';
+// ---------- Nachrichten vom Sensor-Uno ----------
+void setSensorOk(bool ok) {
+  if (ok == sensorOk) {
+    return;
+  }
+  sensorOk = ok;
+  logSimple(F("sensor_status"), ok ? F("online") : F("SENSOR_ERROR"), F(""));
+}
 
-  if (strcmp(topic, TOPIC_TEMP) == 0) {
+void handleLinkLine(char* line) {
+  char* sep = strchr(line, ';');
+  if (sep == nullptr) {
+    logBegin(F("error"));
+    Serial.print(F("invalid_link;"));
+    Serial.println(line);
+    return;
+  }
+  *sep = '\0';
+  const char* key = line;
+  const char* value = sep + 1;
+
+  if (strcmp(key, "temperatur") == 0) {
     char* end;
-    float t = strtof(msg, &end);
-    if (n == 0 || end == msg) {
-      logEvent("error", "invalid_temp", String(msg));
+    double t = strtod(value, &end);
+    if (end == value) {
+      logBegin(F("error"));
+      Serial.print(F("invalid_temp;"));
+      Serial.println(value);
       return;
     }
     lastTemp = t;
     lastTempAt = millis();
     haveTemp = true;
+    setSensorOk(true);   // eine gültige Temperatur heißt: Sensor ok
     updateFan();
-  } else if (strcmp(topic, TOPIC_SET) == 0) {
-    if (strcmp(msg, "ON") == 0)        setMode(MODE_ON, "mqtt");
-    else if (strcmp(msg, "OFF") == 0)  setMode(MODE_OFF, "mqtt");
-    else if (strcmp(msg, "AUTO") == 0) setMode(MODE_AUTO, "mqtt");
-    else logEvent("error", "invalid_command", String(msg));
-  } else if (strcmp(topic, TOPIC_SENSOR_STATUS) == 0) {
-    sensorStatus = String(msg);
-    sensorOk = (strcmp(msg, "online") == 0);
-    logEvent("sensor_status", sensorStatus);
-    updateFan();  // bei SENSOR_ERROR / offline sofort Fail-safe
-  }
-}
-
-void connectWifi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.hostname("laptop-luefter");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("WLAN verbinden");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  logEvent("wifi", "connected", WiFi.localIP().toString());
-}
-
-// Nicht blockierend: höchstens alle MQTT_RETRY_MS ein Verbindungsversuch.
-void ensureMqtt() {
-  if (mqtt.connected() || millis() - lastMqttAttempt < MQTT_RETRY_MS) {
-    return;
-  }
-  lastMqttAttempt = millis();
-
-  String clientId = String("laptop-luefter-") + String(ESP.getChipId(), HEX);
-  const char* user = strlen(MQTT_USER) ? MQTT_USER : nullptr;
-  const char* pass = strlen(MQTT_USER) ? MQTT_PASSWORD : nullptr;
-
-  if (mqtt.connect(clientId.c_str(), user, pass, TOPIC_ONLINE, 1, true, "offline")) {
-    mqtt.publish(TOPIC_ONLINE, "online", true);
-    mqtt.subscribe(TOPIC_TEMP);
-    mqtt.subscribe(TOPIC_SET);
-    mqtt.subscribe(TOPIC_SENSOR_STATUS);
-    publishState();
-    logEvent("mqtt", "connected", MQTT_SERVER);
+  } else if (strcmp(key, "status") == 0) {
+    setSensorOk(strcmp(value, "online") == 0);
+    updateFan();         // bei SENSOR_ERROR sofort Fail-safe
   } else {
-    logEvent("mqtt", "failed", "rc=" + String(mqtt.state()));
+    logBegin(F("error"));
+    Serial.print(F("invalid_link;"));
+    Serial.println(key);
   }
 }
 
+// Liest Zeilen vom Sensor-Uno, ohne zu blockieren.
+void handleLink() {
+  while (link.available() > 0) {
+    char c = link.read();
+    if (c == '\n' || c == '\r') {
+      if (linkLen > 0) {
+        linkBuf[linkLen] = '\0';
+        handleLinkLine(linkBuf);
+        linkLen = 0;
+      }
+    } else if (linkLen < sizeof(linkBuf) - 1) {
+      linkBuf[linkLen++] = c;
+    }
+  }
+}
+
+// ---------- Eingaben ----------
 // Taster schaltet zwischen AUTO und dauerhaft AN.
 void handleButton() {
   int reading = digitalRead(BUTTON_PIN);
@@ -252,33 +234,56 @@ void handleButton() {
   if (millis() - buttonChangedAt > DEBOUNCE_MS && reading != buttonStable) {
     buttonStable = reading;
     if (buttonStable == LOW) {  // gedrückt
-      setMode(mode == MODE_AUTO ? MODE_ON : MODE_AUTO, "taster");
+      setMode(mode == MODE_AUTO ? MODE_ON : MODE_AUTO, F("taster"));
+    }
+  }
+}
+
+void handleCommand(const char* cmd) {
+  if (strcasecmp(cmd, "ON") == 0) {
+    setMode(MODE_ON, F("serial"));
+  } else if (strcasecmp(cmd, "OFF") == 0) {
+    setMode(MODE_OFF, F("serial"));
+  } else if (strcasecmp(cmd, "AUTO") == 0) {
+    setMode(MODE_AUTO, F("serial"));
+  } else {
+    logBegin(F("error"));
+    Serial.print(F("invalid_command;"));
+    Serial.println(cmd);
+  }
+}
+
+// Liest Befehle aus dem Serial Monitor, ohne zu blockieren.
+void handleSerial() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (cmdLen > 0) {
+        cmdBuf[cmdLen] = '\0';
+        handleCommand(cmdBuf);
+        cmdLen = 0;
+      }
+    } else if (cmdLen < sizeof(cmdBuf) - 1) {
+      cmdBuf[cmdLen++] = c;
     }
   }
 }
 
 void setup() {
-  Serial.begin(115200);
-  Serial.println();
+  Serial.begin(BAUD);
+  link.begin(BAUD);
 
   pinMode(FAN_PIN, OUTPUT);
   digitalWrite(FAN_PIN, LOW);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  connectWifi();
-  configTime(NTP_TZ, "pool.ntp.org");
-
-  ArduinoOTA.setHostname("laptop-luefter");
-  ArduinoOTA.begin();
-
-  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
-  mqtt.setCallback(onMessage);
+  Serial.println(F("zeit_s;geraet;ereignis;wert;detail"));
+  logSimple(F("start"), F("AUTO"), F("Befehle: ON, OFF, AUTO"));
 }
 
 void loop() {
-  ArduinoOTA.handle();
-  ensureMqtt();
-  mqtt.loop();
+  handleLink();
+  handleSerial();
   handleButton();
 
   if (millis() - lastCheck >= CHECK_INTERVAL_MS) {

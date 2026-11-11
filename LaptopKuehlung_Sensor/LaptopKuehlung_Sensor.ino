@@ -1,18 +1,20 @@
 /*
-  LaptopKuehlung_Sensor – Knoten 1 der Laptop-Kühlung
+  LaptopKuehlung_Sensor – Seite 1 der Laptop-Kühlung (Arduino Uno)
 
-  Board:  NodeMCU 1.0 (ESP-12E Module), ESP8266-Core 3.1.2
-  Libs:   DHT sensor library (+ Adafruit Unified Sensor), PubSubClient
+  Misst die Temperatur und schickt sie per Kabel (serielle Leitung) an den
+  Lüfter-Uno (LaptopKuehlung_Luefter).
 
-  Verdrahtung DHT22-Modul:
-    +   (VCC)  -> 3V3
-    OUT (DATA) -> D5 (GPIO14)   (nackter 4-Pin-Sensor: zusätzlich 10 kΩ von DATA nach 3V3)
-    -   (GND)  -> GND
+  Board:  Arduino Uno (AVR)
+  Libs:   DHT sensor library (+ Adafruit Unified Sensor)
 
-  Verdrahtung LED-Ampel (jede LED mit ca. 220 Ω Vorwiderstand, kurzes Bein an GND):
-    rot  -> D1 (GPIO5)
-    gelb -> D2 (GPIO4)
-    grün -> D6 (GPIO12)
+  Verdrahtung:
+    DHT22-Modul:  + -> 5V,  OUT -> D2,  - -> GND
+                  (nackter 4-Pin-Sensor: zusätzlich 10 kΩ von DATA nach 5V)
+    LED-Ampel (je ca. 220 Ω Vorwiderstand, kurzes Bein an GND):
+                  rot -> D13,  gelb -> D12,  grün -> D11
+    Verbindung zum Lüfter-Uno:
+                  D3 (Senden) -> D10 am Lüfter-Uno
+                  GND         -> GND am Lüfter-Uno
 
   Anzeige:
     grün        Temperatur <= WARN_TEMP
@@ -20,76 +22,59 @@
     rot         Temperatur >  BAD_TEMP
     rot blinkt  Sensorfehler
 
-  Funktion:
-    - misst alle 5 s die Temperatur und sendet sie nach  <prefix>temperatur  (retained, z. B. "27.3")
-    - Status über  <prefix>sensor/status:  online / SENSOR_ERROR / offline (retained, Last Will)
-    - schreibt Messungen und Statuswechsel als CSV-Zeile nach Serial und  <prefix>log
+  Nachrichten an den Lüfter-Uno (eine Zeile pro Nachricht, 9600 Baud):
+    temperatur;27.3       alle 5 s, wenn der Sensor einen Wert liefert
+    status;SENSOR_ERROR   alle 5 s, solange der Sensor keinen Wert liefert
+    status;online         einmal beim Start
 
-  Zugangsdaten: secrets.example.h nach secrets.h kopieren und ausfüllen.
+  Log über USB (Serial Monitor, 9600 Baud), CSV mit Trennzeichen ;
+    zeit_s;geraet;ereignis;wert;detail
 */
 
-#include <ESP8266WiFi.h>
-#include <ArduinoOTA.h>
-#include <PubSubClient.h>
 #include <DHT.h>
-#include <time.h>
-#include "secrets.h"
+#include <SoftwareSerial.h>
 
 // ---------- Einstellungen ----------
-// Muss in beiden Sketches gleich sein.
-#define TOPIC_PREFIX "laptop/"
-
-const char* DEVICE_NAME = "sensor";
-const uint8_t DHT_PIN = D5;
+const uint8_t DHT_PIN = 2;
 const uint8_t DHT_TYPE = DHT22;
-const uint8_t LED_RED = D1;
-const uint8_t LED_YELLOW = D2;
-const uint8_t LED_GREEN = D6;
+const uint8_t LED_RED = 13;
+const uint8_t LED_YELLOW = 12;
+const uint8_t LED_GREEN = 11;
+const uint8_t LINK_TX_PIN = 3;   // Kabel zum Lüfter-Uno (D10)
+const uint8_t LINK_RX_PIN = 4;   // nicht angeschlossen, SoftwareSerial braucht einen Pin
 
-const float WARN_TEMP = 25.0;   // darüber gelb
-const float BAD_TEMP  = 26.0;   // darüber rot
+const float WARN_TEMP = 25.0;    // darüber gelb
+const float BAD_TEMP  = 26.0;    // darüber rot
 
 const unsigned long MEASURE_INTERVAL_MS = 5000;   // DHT22 schafft höchstens alle 2 s eine Messung
-const unsigned long MQTT_RETRY_MS = 5000;
 const unsigned long BLINK_MS = 250;
-
-const char* TOPIC_TEMP   = TOPIC_PREFIX "temperatur";
-const char* TOPIC_STATUS = TOPIC_PREFIX "sensor/status";
-const char* TOPIC_LOG    = TOPIC_PREFIX "log";
-
-const char* NTP_TZ = "CET-1CEST,M3.5.0,M10.5.0/3";  // Mitteleuropa inkl. Sommerzeit
+const long BAUD = 9600;
 // -----------------------------------
 
 DHT dht(DHT_PIN, DHT_TYPE);
-WiFiClient wifiClient;
-PubSubClient mqtt(wifiClient);
+SoftwareSerial link(LINK_RX_PIN, LINK_TX_PIN);
 
 unsigned long lastMeasure = 0;
-unsigned long lastMqttAttempt = 0;
 bool sensorError = false;
 
-// Zeitstempel "YYYY-MM-DD HH:MM:SS"; ohne NTP-Zeit die Laufzeit seit dem Start.
-String timestamp() {
-  time_t now = time(nullptr);
-  if (now < 1700000000) {
-    return "uptime " + String(millis() / 1000) + "s";
-  }
-  struct tm t;
-  localtime_r(&now, &t);
-  char buf[20];
-  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
-  return String(buf);
+// ---------- Logging ----------
+// Schreibt "zeit_s;sensor;ereignis;" – Wert und Detail hängt der Aufrufer an.
+void logBegin(const __FlashStringHelper* event) {
+  Serial.print(millis() / 1000);
+  Serial.print(F(";sensor;"));
+  Serial.print(event);
+  Serial.print(';');
 }
 
-// Eine CSV-Zeile: zeit;gerät;ereignis;wert;detail
-void logEvent(const char* event, const String& value, const String& detail = "") {
-  String line = timestamp() + ";" + DEVICE_NAME + ";" + event + ";" + value + ";" + detail;
-  Serial.println(line);
-  if (mqtt.connected()) {
-    mqtt.publish(TOPIC_LOG, line.c_str());
-  }
+void logSimple(const __FlashStringHelper* event, const __FlashStringHelper* value,
+               const __FlashStringHelper* detail) {
+  logBegin(event);
+  Serial.print(value);
+  Serial.print(';');
+  Serial.println(detail);
 }
 
+// ---------- Anzeige ----------
 void setLeds(bool red, bool yellow, bool green) {
   digitalWrite(LED_RED, red);
   digitalWrite(LED_YELLOW, yellow);
@@ -106,50 +91,17 @@ void showTemperature(float temp) {
   }
 }
 
-const char* statusText() {
-  return sensorError ? "SENSOR_ERROR" : "online";
-}
-
-void connectWifi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.hostname("laptop-sensor");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.print("WLAN verbinden");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  logEvent("wifi", "connected", WiFi.localIP().toString());
-}
-
-// Nicht blockierend: höchstens alle MQTT_RETRY_MS ein Verbindungsversuch.
-// So laufen Messung und LED-Ampel weiter, auch wenn der Broker weg ist.
-void ensureMqtt() {
-  if (mqtt.connected() || millis() - lastMqttAttempt < MQTT_RETRY_MS) {
-    return;
-  }
-  lastMqttAttempt = millis();
-
-  String clientId = String("laptop-sensor-") + String(ESP.getChipId(), HEX);
-  const char* user = strlen(MQTT_USER) ? MQTT_USER : nullptr;
-  const char* pass = strlen(MQTT_USER) ? MQTT_PASSWORD : nullptr;
-
-  if (mqtt.connect(clientId.c_str(), user, pass, TOPIC_STATUS, 1, true, "offline")) {
-    mqtt.publish(TOPIC_STATUS, statusText(), true);
-    logEvent("mqtt", "connected", MQTT_SERVER);
-  } else {
-    logEvent("mqtt", "failed", "rc=" + String(mqtt.state()));
-  }
-}
-
+// ---------- Sensor ----------
 void setSensorError(bool error) {
   if (error == sensorError) {
     return;
   }
   sensorError = error;
-  mqtt.publish(TOPIC_STATUS, statusText(), true);
-  logEvent("sensor_status", statusText(), error ? "DHT22 liefert NaN, Verkabelung prüfen" : "Sensor wieder ok");
+  if (error) {
+    logSimple(F("sensor_status"), F("SENSOR_ERROR"), F("DHT22 liefert NaN, Verkabelung pruefen"));
+  } else {
+    logSimple(F("sensor_status"), F("online"), F("Sensor wieder ok"));
+  }
 }
 
 void measure() {
@@ -157,24 +109,31 @@ void measure() {
   float hum = dht.readHumidity();
 
   if (isnan(temp)) {
-    // Kein Wert senden. Der Lüfter-Knoten geht bei SENSOR_ERROR sofort in den Fail-safe.
     setSensorError(true);
+    // Jedes Mal senden, damit auch ein neu gestarteter Lüfter-Uno den Fehler mitbekommt.
+    link.println(F("status;SENSOR_ERROR"));
     return;
   }
   setSensorError(false);
   showTemperature(temp);
 
-  char payload[8];
-  dtostrf(temp, 1, 1, payload);
-  mqtt.publish(TOPIC_TEMP, payload, true);
+  link.print(F("temperatur;"));
+  link.println(temp, 1);
 
-  String detail = isnan(hum) ? String("") : "hum=" + String(hum, 0) + "%";
-  logEvent("temp", payload, detail);
+  logBegin(F("temp"));
+  Serial.print(temp, 1);
+  Serial.print(';');
+  if (!isnan(hum)) {
+    Serial.print(F("hum="));
+    Serial.print(hum, 0);
+    Serial.print('%');
+  }
+  Serial.println();
 }
 
 void setup() {
-  Serial.begin(115200);
-  Serial.println();
+  Serial.begin(BAUD);
+  link.begin(BAUD);
 
   pinMode(LED_RED, OUTPUT);
   pinMode(LED_YELLOW, OUTPUT);
@@ -183,20 +142,12 @@ void setup() {
 
   dht.begin();
 
-  connectWifi();
-  configTime(NTP_TZ, "pool.ntp.org");
-
-  ArduinoOTA.setHostname("laptop-sensor");
-  ArduinoOTA.begin();
-
-  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
+  Serial.println(F("zeit_s;geraet;ereignis;wert;detail"));
+  logSimple(F("start"), F("online"), F(""));
+  link.println(F("status;online"));
 }
 
 void loop() {
-  ArduinoOTA.handle();
-  ensureMqtt();
-  mqtt.loop();
-
   if (millis() - lastMeasure >= MEASURE_INTERVAL_MS) {
     lastMeasure = millis();
     measure();
