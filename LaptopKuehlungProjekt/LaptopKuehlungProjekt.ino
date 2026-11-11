@@ -21,6 +21,7 @@ LED     GPIO4 / D2
 Lüfter  GPIO12 / D6
 */ 
 
+#include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoOTA.h>
 
