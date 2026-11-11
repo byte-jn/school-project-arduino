@@ -24,10 +24,18 @@ ESP8266-Core installieren:
 1. **Datei → Einstellungen → Zusätzliche Boardverwalter-URLs**:
    `https://arduino.esp8266.com/stable/package_esp8266com_index.json`
    (Quelle: [esp8266/Arduino](https://github.com/esp8266/Arduino#installing-with-boards-manager))
-2. **Boardverwalter** öffnen, nach `esp8266` suchen und installieren.
-3. **Werkzeuge → Board → esp8266 → NodeMCU 1.0 (ESP-12E Module)** auswählen.
+2. **Boardverwalter** öffnen, nach `esp8266` suchen und installieren (getestet mit 3.1.2).
+3. Arduino IDE **komplett schließen und neu öffnen**, sonst kennt sie den neuen Core nicht.
+4. **Werkzeuge → Board → esp8266 → NodeMCU 1.0 (ESP-12E Module)** auswählen und den COM-Port setzen. Unten rechts in der Statusleiste muss danach „NodeMCU 1.0 (ESP-12E Module)“ stehen.
 
-Der ESP8266-Core bringt `ESP8266WiFi` und `ArduinoOTA` bereits mit. Diese Bibliotheken nicht zusätzlich installieren: Eine separat installierte `ArduinoOTA` (Juraj Andrassy) hat eine andere API und führt zu Kompilierfehlern (`WiFiUdp.h: No such file or directory`).
+Der ESP8266-Core bringt `ESP8266WiFi` und `ArduinoOTA` bereits mit. Diese Bibliotheken nicht zusätzlich über die Bibliotheksverwaltung installieren.
+
+### Typische Fehler
+
+| Fehlermeldung | Ursache | Lösung |
+|---|---|---|
+| `WiFiUdp.h: No such file or directory` | Falsches Board gewählt (z. B. Arduino Uno). Der Uno hat kein WLAN. | Board auf **NodeMCU 1.0 (ESP-12E Module)** umstellen. |
+| `ESP8266WiFi.h: No such file or directory` | ESP8266-Core fehlt oder IDE wurde nach der Installation nicht neu gestartet. | Core installieren (siehe oben), IDE neu starten, Board wählen. |
 
 ### Bibliotheken (`libraries/`)
 
@@ -40,6 +48,8 @@ Der ESP8266-Core bringt `ESP8266WiFi` und `ArduinoOTA` bereits mit. Diese Biblio
 Alle drei sind über **Werkzeuge → Bibliotheken verwalten** installierbar. Der Ordner `libraries/` ist per `.gitignore` vom Repository ausgeschlossen und muss auf einem neuen Rechner neu installiert werden.
 
 Reaktionszeit, AnalogeDatenauslesung und Wiederstandsmessen brauchen keine zusätzlichen Bibliotheken.
+
+In `libraries/` sollen nur diese drei Bibliotheken liegen. Andere Bibliotheken werden von keinem Sketch verwendet und können entfernt werden.
 
 ### Konfiguration LaptopKuehlungProjekt
 
